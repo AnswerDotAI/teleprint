@@ -15,13 +15,15 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
 ]
 
-dependencies = []
+dependencies = ["rich"]
 
 [project.optional-dependencies]
 dev = [
   "fastship",
   "build",
   "twine",
+  "pytest",
+  "pyghostty",
 ]
 
 [project.urls]
