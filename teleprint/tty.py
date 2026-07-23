@@ -26,6 +26,16 @@ class RealTty:
 
     def flush(self): pass
 
+    def raw(self):
+        """Enter full raw mode for a job borrow: ISIG off so ^C/^Z reach the job through the pty
+        line discipline instead of signaling the app, ECHO off, OPOST off for byte-faithful relay."""
+        self._app_mode = termios.tcgetattr(self.fd)
+        _tty.setraw(self.fd)
+
+    def cooked(self):
+        "Return to app (cbreak-plus) mode after a borrow."
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self._app_mode)
+
     def read(self, timeout=0.02):
         "All bytes arriving within `timeout` (draining briefly once something arrives); b'' when none."
         out = b''

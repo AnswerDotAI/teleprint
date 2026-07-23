@@ -258,6 +258,46 @@ class Compositor:
         self._repark()
         return blk
 
+    def record_block(self, body=None, gutter=None, tag=None, collapse_at=None):
+        """A model-only block: enters the model already committed, painting nothing -- for content
+        whose bytes are already on glass (a fg job's pty output). The transcript view, persistence,
+        and the Dialog all see it; the screen never repeats it."""
+        blk = Block(self._next_id, body, gutter=gutter, tag=tag, collapse_at=collapse_at)
+        self._next_id += 1
+        self.blocks[blk.id] = blk
+        self._content_lines(blk)  # sets height, so the collapse threshold and views work
+        if blk.collapse_at and blk.height > blk.collapse_at: blk.collapsed = True
+        blk.committed = True
+        return blk
+
+    def release(self):
+        """Begin a borrow: the borrower (a fg job on the pty) owns the terminal until `reanchor`.
+        Visible blocks archival-restyle and commit -- the borrower's output will scroll them into
+        history -- and the tail (chrome, not transcript) is erased, leaving the cursor at column 0
+        of a fresh line for the borrower to print from."""
+        self._commit_scrolled(self.rows, len(self._lines))
+        self._unpark()
+        if self._ntail:
+            k = self._ntail - 1
+            self.tty.write((f'\x1b[{k}A' if k else '') + '\r\x1b[J')
+            self._park -= k
+        elif self._lines:
+            self.tty.write('\r\n')
+            self._park = min(self._park + 1, self.rows - 1)
+        for b in self.blocks.values(): b.committed = True
+        self._lines = []
+        self._ntail = 0
+        self._tail_cursor = None
+
+    def reanchor(self):
+        "End a borrow: whatever the borrower painted is history now; adopt the (possibly new) size and relearn the origin via CPR."
+        self._adopt_size()
+        for b in self.blocks.values(): b.committed = True
+        self._lines = []
+        self._ntail = 0
+        self._coff = self._ccol = 0
+        self._home()
+
     def clear(self, *blks):
         "The ctrl-L gesture: scroll the screen into history (one history: never erase printed transcript), then reprint `blks` from the model, live again."
         self._commit_scrolled(self.rows, len(self._lines))  # archival-restyle whole visible blocks first: they are about to become history

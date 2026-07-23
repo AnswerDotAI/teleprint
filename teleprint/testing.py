@@ -25,6 +25,8 @@ class FakeTty:
         self.term.feed(data)
 
     def flush(self): pass
+    def raw(self): pass      # borrow-mode termios changes have no headless equivalent
+    def cooked(self): pass
 
     def read(self):
         "All pending input bytes (injected and emulator responses), b'' when none."

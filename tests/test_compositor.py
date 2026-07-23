@@ -325,3 +325,39 @@ def test_collapsed_summary_cropped():
     for bid, segs in comp._lines:
         assert sum(cell_len(s.text) for s in segs) <= 30
     assert tty.term.text().splitlines()[-1] == 'tail'
+
+def test_record_block_paints_nothing():
+    tty, comp = make(40, 10)
+    comp.print_block('visible one', gutter=G)
+    before = tty.term.text()
+    blk = comp.record_block('line a\nline b\nline c', gutter=G, tag='sh', collapse_at=2)
+    assert tty.term.text() == before          # nothing painted
+    assert blk.committed and blk.collapsed    # in the model, folded past its threshold
+    assert blk.height == 3 and comp.blocks[blk.id] is blk
+
+def test_release_then_reanchor():
+    "The borrow choreography: tail erased (chrome), blocks committed; job bytes flow raw; reanchor resumes below."
+    tty, comp = make(40, 10)
+    b1 = comp.print_block('block one', gutter=G)
+    comp.set_tail(Text('status'), Text('> '), cursor=(1, 2))
+    comp.release()
+    scr = tty.term.text()
+    assert 'block one' in scr and 'status' not in scr  # tail gone from glass, content stays
+    assert b1.committed and comp._ntail == 0 and comp._lines == []
+    tty.write(b'job says hi\r\njob line two\r\n')      # the borrower prints directly
+    comp.reanchor()
+    comp.print_block('after the job', gutter=G)
+    comp.set_tail(Text('> '))
+    lines = tty.term.text().splitlines()
+    assert lines.index('job says hi') < lines.index('» after the job') < lines.index('>')
+    assert 'status' not in tty.term.contents()          # the erased tail never entered history
+
+def test_release_with_no_tail():
+    tty, comp = make(40, 10)
+    comp.print_block('only block', gutter=G)
+    comp.release()
+    tty.write(b'raw\r\n')
+    comp.reanchor()
+    comp.set_tail(Text('> '))
+    lines = tty.term.text().splitlines()
+    assert lines.index('» only block') < lines.index('raw') < lines.index('>')

@@ -386,3 +386,233 @@ Fit is excellent because the shapes already match:
 Not covered by adoption: provider-thread reuse (codex threads, claude-cli resume) stays orthogonal;
 `aim_info` capability dicts must be supplied per backend/model; fastllm's codex.py module itself is
 an empty stub (the vendor mapping is the working path).
+
+## cp4: fastllm/llmsurgery adoption (Jeremy: GO, 2026-07-24 afternoon)
+
+Scope expanded past the proposal above by the post-lunch discussion: fastllm's native `codex`
+vendor (chatgpt backend-api completions + auth-json token) and fastllm-claude-code's registered
+`claude_code` api make BOTH CLI backends moot, so the whole backend layer collapses to one
+fastllm backend plus a model/vendor table (~930 lines deletable: codex_client 287,
+claude_client 265, api_client 82, most of backend_common 262, backends 39; tooling.py's
+provider-shape adapters go too -- fastllm takes tools/ns directly). Also cements core.py's
+deletion (nothing in the new stack imports it).
+
+Agreed order: (1) mechanical lisette->fastllm swap; (2) Dialog as the session model + dlg2hist
+(deletes context()/seed_to_*/full_prompt XML assembly; save/load-.ipynb becomes Dialog save/load);
+(3) reply serialization via AsyncStreamFormatter tee (hist2fmt canonical string stored,
+TurnRenderer consumes fastllm item shapes); (4) CLI-backend deletions.
+
+Constraints from Jeremy: fastllm-claude-code is NOT recently tested -- wire it but defer heavy
+testing; he is checking it in parallel; tell him when it is the last untested item. Commits are
+his (he commits as we go).
+
+cp4 BUILT (same afternoon). All four steps landed as one pass; ipyai suite 41 passed (the 36-test
+drop is the deleted legacy suite: no deselects remain -- the live-LLM roundtrip tests died with
+their backends). Live-verified end to end in tmux on the codex vendor: routed prompt, streamed
+reply, `py` tool call into the live kernel, kernel writeback, persistence, `--sessions`, resume.
+
+As-built notes:
+- **Deleted**: core.py (1013), codex_client (287), claude_client (265), backend_common (262),
+  api_client (82), old backends registry, mcp_server.py + mcp_bridge.py + the `ipyai-mcp-bridge`
+  console script (their only consumer was claude_client; fastllm-claude-code bridges tools with
+  its own in-process MCP server), samples/ + tools/capture_samples.sh (stream-shape research for
+  the deleted clients), and 9 test files. Deps: lisette + mcp out; fastllm, fastllm-claude-code,
+  llmsurgery, apsw in.
+- **backends.py is now a table**: BackendSpec carries AsyncChat routing kwargs. `codex` =
+  vendor_name codex (auth from ~/.codex/auth.json); `claude` = api_name+vendor_name claude_code
+  (lazy `import fastllm_claude_code.core` at chat construction -- the bare package import does
+  NOT register the api, a trap found by checking); `claude-api` = anthropic + cache. Old names
+  (codex-api, claude-cli) alias to the new, so existing config files resolve.
+- **The session IS a Dialog** (llmsurgery): add_cell appends code/note messages (bare-string
+  cells become markdown notes, nbformat outputs verbatim), run_prompt appends a prompt message
+  and sets its output to the reply (the Message.output setter wraps prompt_output and clears the
+  ai_output cache). Context = `dlg2hist`; var/shell `$`v``/`!`c`` expansions are extra str parts
+  prepended to the final prompt parts. On backend failure the pending prompt message is removed
+  so a retry cannot double it (regression-tested).
+- **One stream, two consumers**: the AsyncChat stream tees into AsyncStreamFormatter
+  (format_item per item -> fmt.outp is the canonical stored/replayed form, fmt2hist-round-trip
+  tested) and TurnRenderer (blocks). TurnRenderer's vocabulary is now fastllm's: dicts with
+  text/thinking deltas, Part tool_use/tool_result; the old kind-dict events and command_* family
+  are gone. Interrupt marker is now solveit's `*[Response interrupted]*` (ai_fmt strips it on
+  replay). chat.use lands on Assistant.last_use; the context meter (built 2026-07-24 evening) uses the
+  new fastllm AsyncChat.last_req_use (one-line addition to _track: per-request usage, since chat.use sums
+  a turn's tool-call steps and would overcount context) -- Assistant.ctx_usage = (prompt+completion tokens
+  of the final request, aim_info max_input_tokens), painted as 'ctx 34.2k/256k (13%)' in the dim status
+  line. Cost display skipped as moot under subscription auth (Jeremy). Jeremy's stale sysp.txt deleted;
+  the current default regenerates on next launch.
+- **Resume renders stored replies via fmt2hist**: text parts feed the md flow (the stored `- ⏳`
+  progress markers are filtered for display), tool parts replay through TurnRenderer.event as
+  real collapsed tool blocks -- better than the old flattened 🔧 form. Old-format stored replies
+  fall back to feeding the raw text.
+- **provider_session_id plumbing deleted end to end** (store schema, save_prompt, resume_state):
+  the codex vendor is stateless completions and claude_code replays history per turn.
+- Sysp/system prompt: DEFAULT_SYSTEM_PROMPT now describes `<code>`/`<markdown>` message context
+  (dlg2hist's shape). Jeremy's existing sysp.txt persists with the old prose -- worth refreshing.
+
+NOT yet tested: the `claude` backend live (fastllm-claude-code is wired and its api registration
+verified, but no live turn has run -- Jeremy is checking that package in parallel; it is now THE
+last untested item). Also untested live: claude-api (mechanical anthropic vendor, low risk).
+
+## cp5 built (2026-07-23): the jobs layer
+
+As built, teleprint side: `jobs.py` ports ipythonng's pty shepherd (fork on a fresh pty; shepherd
+forks the command in its own pgrp, tcsetpgrp, status pipe relaying `pgid`/`stopped`; exit code
+carried via os._exit with >128 signal encoding; finish_job reaps BEFORE closing the master), plus
+three additions: winsize at spawn (shepherd-side ioctl, so the command never races it) and
+`Job.resize` for SIGWINCH forwarding; `cwd=` (chdir in the shepherd); and the blocking copy loop
+became asyncio `relay_job` (returns 'eof'|'stopped') with `watch_job` as the bg drain wrapper.
+Compositor grew the borrow choreography: `release()` (commit everything, erase the tail, cursor to
+col 0) / `reanchor()` (adopt size, relearn origin via CPR), and `record_block()` -- a model-only
+block that paints nothing. RealTty grew `raw()`/`cooked()` (ISIG off during a borrow so ^C/^Z reach
+the job through the pty line discipline; ECHO/OPOST off for byte-faithful relay); FakeTty no-ops.
+
+ipyai side: `route()` gained a 'job' kind -- a SINGLE-LINE bare-`!` command (or `%fg`), in either
+mode; multiline or embedded `!` (`x = !ls`) stays kernel-side code with exact SList semantics.
+`App.run_job`: fg jobs release the compositor, remove the app's tty reader, go raw, and relay with
+output tee'd into a mirror -- a headless pyghostty Terminal sized like the tty; at exit the
+mirror's `contents()` (scrollback+screen) becomes a model-only residue block plus an
+`assistant.add_cell` record, and nonzero exits print a small `exit N`/`signal N` error block (there
+is no `$?` to consult). `cmd &` (we strip the `&`; sh never sees it) spawns + `watch_job`: the
+continuous drain fixes ipythonng gap 1 (pty-buffer stall), and the reap callback fixes gap 2 --
+residue prints as a NORMAL block (bg wrote nothing on glass) with a `[n] done` note. Reaps arriving
+during a borrow defer until reanchor. `%fg [n]` is intercepted app-side: SIGCONT + re-borrow; a
+still-RUNNING bg job can also be foregrounded (its watcher is cancelled and the fg relay takes
+over). SIGWINCH during a borrow forwards to job + mirror only; the compositor adopts the size at
+reanchor. cwd is queried from the kernel per spawn (`eval_expr`), fallback os.getcwd().
+
+Design record -- the mirror IS the cleaner: no regex or heuristics digest job output; the emulator
+does. The alt screen erases itself from `contents()` by its own semantics, which implements
+Jeremy's vim rule for free (vim configured to keep the alt screen leaves its last screen in
+history; default vim leaves nothing). Known env quirk, by design: a bare-`!` job runs in the UI
+process's environment (cwd synced per spawn, env vars NOT), while kernel-side `!` sees the
+kernel's. Left for later: quitting with live bg/stopped jobs orphans them (no shell-style "there
+are stopped jobs" gate yet); bg mirrors keep their spawn size until a `%fg` resize; `%jobs` peek
+(render a running job's mirror) parked.
+
+## Since cp5 (2026-07-23): claude backend verified; async magics consolidated; %ipyai designed
+
+Claude backend live-verified (real `ipyai -b claude` in tmux via fastmux.bg -- bgtmux is now
+fastmux.bg): streamed replies, tool turns through the kernel bridge, cross-turn history, think
+blocks, ctrl-C mid-stream leaves a healthy session. Both model call sites already stream
+(`run_prompt` and completions both pass `stream=True`; the claude_code backend raises on
+stream=False, so a future non-streaming path fails loudly). One issue found, belongs to
+fastllm-claude-code not ipyai: tool-result continuation resumes with prompt "." and the model
+visibly narrates interpreting it (core.py:39 anticipated this; make a proper tool-use prompt).
+
+Async magics consolidated into `fastcore.aio`: `enable_async_magics(ip, fmt=None)` /
+`disable_async_magics(ip)` -- one line transform rewriting `run_line_magic`/`run_cell_magic` calls
+(top-level only; function bodies stay sync) into `await maybe_await(...)`, plus class-level
+`run_cell_magic` wrap, per-shell sentinel so double-enable (e.g. ipyai user imports
+ipykernel-helper) wraps exactly once, `fmt=` hook preserving ipykernel-helper's FT-to-HTML
+layering. Migrated: ipykernel-helper (deleted its copy, passes fmt), ipythonng (deleted
+`_await_magic`, 45 passed), ipymini (enabled in MiniShell, 83 passed incl. an e2e async line
+magic through a real kernel). fastcore 03c_aio.ipynb has the unit story.
+
+%ipyai design (agreed with Jeremy, building next): a NORMAL kernel-side line magic in
+`ipyai/magic.py`, talking to the host app over jupyter comms -- no unix socket, no app-side
+intercept. route() already sends `%ipyai ...` lines to the kernel as code in both modes.
+Mechanics: magic opens `comm.create_comm(target_name='ipyai')` (comm_open/comm_msg ride iopub);
+ALL commands are async request/reply -- `kernel.unlock()` then await the host's comm_msg ack with
+~5s timeout, so "no ipyai host attached" fails loudly everywhere and results return as ordinary
+cell output (flows into cell_outputs -> context + persistence for free). unlock costs nothing
+here: a bare magic line is the whole cell, and the app pipelines nothing (Enter gated on busy).
+Non-ipymini kernels: raise (no unlock -> no reply path; no silent fire-and-forget fallback).
+Host side: KernelSession.run and kernel_bridge's drain currently drop non-OUTPUT_MSGS iopub;
+both must route comm_open/comm_msg to one handler; replies go `kc.shell_request('comm_msg',
+reply=False, comm_id=..., data=...)` (concexec tests prove mid-cell delivery under unlock).
+Registration exec'd into the kernel at attach_assistant. Nothing special for completion/help:
+magic-name tab-completion and `%ipyai?` come free from the kernel's own machinery (the app
+routes Tab/shift-Tab through complete_request/inspect_request); subcommand completion would need
+a custom complete_command hook -- skipped for now. Scope (the "fairly obvious" set): bare
+`%ipyai` returns current settings + command list; `model`, `completion_model`, `think`,
+`code_theme` (future blocks only -- bodies store highlighted Text), `prompt` (toggle prompt
+mode), `sessions`. Settings are session-only (no config.json write; old behavior). Deferred,
+each pending a decision: `reset` (new session row vs append?), `save`/`load` (PNG prune policy;
+file-save vs sqlite store overlap), backend switching, `%%ipyai` cell magic (dead: prompt mode
+covers it). ipyai/README.md is stale end to end (old process model, old backend names, old tool
+list, `-l` flag); the %ipyai command set decides its rewrite.
+
+%ipyai as built (2026-07-23), design above held with two deviations: (1) the bridge path is NOT
+wired -- a `py`-tool-invoked `%ipyai` would need nested async run_cell inside the kernel's
+running loop, which IPython can't do, so ConBridge stays untouched and that path fails via the
+magic's own timeout; only KernelSession.run routes COMM_MSGS (to `App._on_comm` via the
+`on_comm` attr). (2) Setters double as getters (`%ipyai model` shows the value). Pieces:
+kernel-side `ipyai/magic.py` (async `ipyai()` magic, module-level comm + req-numbered pending
+futures, PrettyString acks, UsageError for host-reported errors, RuntimeError for no-unlock and
+timeout); host-side `App._on_comm` (comm_open tracks id, comm_msg dispatches `_ipyai_cmd`, ack
+by req id) + `_ipyai_cmd` (settings text / setters on Assistant attrs / theme / prompt toggle /
+`_sessions_text` shared with --sessions); registration via extension_manager.load_extension in
+attach_assistant (try/except: kernels without ipyai just lack the magic). Tests
+(ipyai tests/test_magic.py, 3): e2e settings/setter/getter/toggle/unknown-cmd, `x = %ipyai ...`
+assignment capture, and no-host loud-failure (on_comm unwired, kernel-side _TIMEOUT shrunk).
+Suite 51 passed. Live-verified in tmux: all commands incl. sessions against the real store,
+`%ipyai?` docstring help and settings display both render as blocks (tall enough screens; small
+ones auto-collapse -- that fold hid the settings block in the first test run, 16-row FakeTty).
+One live note: Enter is gated while a cell runs (by design), so scripted drivers must wait for
+the ack block before the next submit or input piles up in the composer.
+
+## Decisions round, 2026-07-23 evening (all agreed with Jeremy)
+
+**Transcript view becomes copy-mode** (tmux/less/vim-normal over blocks): one modal view, block
+cursor, single-key ops. Search `/` `?` `n` `N`, motion `g` `G`. Search runs over the MODEL (block
+sources/text), never the painted screen, so it finds matches inside collapsed blocks; landing in
+one expands it (vim's fold-open-on-search rule). `y` = model-granularity copy: the block's stored
+source (unwrapped, no gutters, no fold markers) to the system clipboard via OSC 52 (survives
+ssh/tmux).
+
+**Editing is model-first; the glass is a log.** The durable main screen stays append-only (the
+thesis holds): edits never repaint history. All edits -- cut/paste to move, edit a prompt's input
+or a reply's text, edit cell source, drop/pin for AI context -- apply to the session Dialog (+
+store), where aidialog's cut_msgs/paste_msgs/move_msgs/msg editors already do the work. The
+transcript view re-renders from the model, so it is both the editor surface and where edits show;
+context assembly, resume, and export read the model, so edits flow everywhere downstream.
+Optional one-line note block on the main screen keeps the log honest. `e` loads the block's
+source into the shared composer; Enter writes back (no re-exec; re-run-after-edit maybe later).
+Structural ops work at MESSAGE granularity (cell+outputs, prompt+reply move together); collapse
+and `y` stay block-level. Proposed keys (approved in principle): `y` copy, `x` cut, `p`
+paste-after, `e` edit, `d` drop-from-context, `*` pin. Dialog editing is the tricky part -- its
+own later checkpoint.
+
+**%ipyai decisions:** `reset` = fresh AI conversation AND a new session row (honest resume
+boundaries), kernel untouched. `save`/`load` = EXPORT/IMPORT of the Dialog as .ipynb
+(Jupyter/solveit-openable); sqlite stays the single resume source; export-to-ipynb IS `%ipyai
+save`, not a separate feature. Image persistence: cap at 2M pixels total per image, downscale-
+to-fit at persist time (display stays full size), image/jpeg handled alongside image/png.
+
+**Backends dissolve into model strings** (solveit's shape: `codex/gpt-5.6-luna` etc., vendor as
+first path segment, split('/',1)). One flat namespace: `%ipyai model claude_code/claude-sonnet-4-6`
+is just a model change mid-session; the backend-switching question evaporates. The split belongs
+in FASTLLM, not per-app: mk_client's resolution chain (explicit vendor -> base_url+key ->
+infer_api_name) gains a vendor-prefix branch; bare names keep working; multi-slash model paths
+fine (first segment only). claude_code promotes to a resolvable vendor (it's a transport, not an
+HTTP vendor -- the resolution branch must consult the api registry, not just vendor_mapping; the
+acomplete.py:153 special case is the seam). The prefix earns its keep:
+claude_code/claude-sonnet-4-6 vs anthropic/claude-sonnet-4-6 is subscription-CLI vs API-key for
+the SAME model name -- only the prefix can carry that. Then ipyai deletes: backends.py, config's
+per-backend models table (collapses to two vendor/model strings), the -b flag (or alias sugar).
+fastllm change needs care: it has other users. Solveit's own split-and-pass can delete later.
+
+**Also:** fastllm-claude-code "." continuation issue: FIXED by Jeremy (the note above is stale).
+teleprint README: move Thesis/Surfaces/Why-not sections out of this file via exhash cross-file
+`m` (verbatim, no drift) plus connective tissue. ipyai README: full rewrite, now unblocked.
+Jobs-layer leftovers (quit-with-live-jobs gate, %jobs peek, bg mirror resize) confirmed wanted.
+Package split (Jeremy, 2026-07-23): llmsurgery's dialog layer (dialog/hist/dlgskill/ipynb) is now
+the `aidialog` package; llmsurgery keeps transcript surgery (ant/antskill/compact/oai). ipyai's
+runtime imports (`Dialog`, `prompt_output`, `dlg2hist`) already come from aidialog, and the
+dialog-editing checkpoint builds on aidialog. Earlier "llmsurgery" mentions in this file are
+historical records: read them as the dialog layer, i.e. today's aidialog.
+
+## Proposed next checkpoints (PROPOSAL, decision Jeremy's)
+
+**cp6 -- copy-mode v1 (search + copy; no dialog editing).** The modal vocabulary lands with its
+two easy verbs: `/` `?` `n` `N` `g` `G` over the block model with expand-on-land, `y` via OSC 52
+(RealTty write; FakeTty asserts the escape). Establishes the key-dispatch structure the editing
+verbs will later join.
+
+**cp7 -- the flat model namespace + %ipyai round-out.** (a) fastllm: vendor-prefix parsing in
+mk_client + claude_code as resolvable vendor, with tests, treading carefully (published users);
+(b) ipyai deletion pass: backends.py gone, config collapses, -b to sugar; (c) `%ipyai reset`
+(new session row), `%ipyai save`/`load` as Dialog export/import, `-l` startup load; (d) image
+cap (2Mpx downscale, jpeg); (e) README pass: teleprint README assembled from DEV.md sections via
+exhash moves, ipyai README rewritten. Dialog editing (cut/paste/edit/drop/pin) and the jobs-layer
+leftovers stay parked for cp8+.
