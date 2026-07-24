@@ -1,4 +1,5 @@
-__version__ = "0.1.0"
+__version__ = "0.1.1"
+
 
 from .blocks import Block
 from .compositor import Compositor
