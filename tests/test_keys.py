@@ -11,7 +11,7 @@ def test_printables_and_controls():
     assert feed1('é') == Key('é', 'é')
     assert feed1('日') == Key('日', '日')
     assert feed1('\r') == Key('enter')
-    assert feed1('\n') == Key('ctrl+j')
+    assert feed1('\n') == Key('enter')   # 0x0a is enter, like 0x0d: pastes/scripts send it, and readline's C-j is accept-line
     assert feed1('\t') == Key('tab')
     assert feed1('\x7f') == Key('backspace')
     assert feed1('\x01') == Key('ctrl+a')
@@ -43,11 +43,21 @@ def test_split_sequences():
     assert p._buf == b''
 
 def test_lone_escape_flush():
+    "flush arms on first sight and fires on the second: a just-arrived ESC may be a split sequence."
     p = Parser()
     assert p.feed(b'\x1b') == []
-    assert p.flush() == [Key('escape')]
+    assert p.flush() == []                             # armed: could still be a sequence head
+    assert p.flush() == [Key('escape')]                # still alone a tick later: the escape key
     assert p.feed(b'\x1b[') == []
+    assert p.flush() == []
     assert p.flush() == [Key('escape'), Key('[', '[')]  # ESC resolved; the '[' reparses as a printable
+
+def test_flush_never_shatters_split_sequence():
+    "A CPR reply split across reads survives an intervening flush tick (the resize-wedge bug's second half)."
+    p = Parser()
+    assert p.feed(b'\x1b') == []
+    assert p.flush() == []                             # armed, not fired
+    assert p.feed(b'[48;87R') == [CPR(47, 86)]         # the tail arrives: reparsed whole, no garbage keys
 
 def test_paste():
     p = Parser()

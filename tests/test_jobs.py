@@ -1,96 +1,88 @@
-"The jobs layer: real processes on real ptys, output mirrored into a headless terminal."
-import asyncio, os, signal
+"The shell layer: a persistent bash/zsh on its own pty, sentinel boundaries, emulator-cleaned residue."
+import asyncio, os
 import pyghostty
-from teleprint.jobs import spawn_job, relay_job, watch_job, finish_job
-from teleprint.testing import FakeTty
+from teleprint.jobs import spawn_shell, relay_shell, finish_job
 
-SH = '/bin/sh'  # pinned: the user's $SHELL must not shape test behavior
+async def _boot(sh='bash', size=(80, 24), cwd=None):
+    s = spawn_shell(size=size, cwd=cwd, sh=sh)
+    with pyghostty.Terminal(*size) as boot:
+        assert (await asyncio.wait_for(relay_shell(s, mirror=boot), 15))[0] == 'prompt'
+    return s
 
-def test_fg_echo_and_residue():
-    "Foreground: bytes reach the screen and the mirror; the mirror's contents are the clean residue."
+async def _run(s, cmd, size=(80, 24)):
+    "One command through the shell; returns (result, cleaned residue)."
+    with pyghostty.Terminal(*size) as m:
+        os.write(s.master_fd, cmd.encode() + b'\n')
+        res = await asyncio.wait_for(relay_shell(s, mirror=m), 15)
+        return res, m.contents().strip()
+
+async def _quit(s):
+    os.write(s.master_fd, b'exit\n')
+    assert await asyncio.wait_for(relay_shell(s), 15) == 'eof'
+    finish_job(s)
+
+def _shell_roundtrip(sh):
+    "Boundary sentinel with exit code + pwd; state persists; the written command never echoes."
     async def go():
-        tty = FakeTty(60, 12)
-        with pyghostty.Terminal(60, 12) as mirror:
-            job = spawn_job('echo hello world', sh=SH, size=(60, 12))
-            res = await asyncio.wait_for(relay_job(job, tty.write, mirror=mirror), 10)
-            assert res == 'eof' and job.state == 'done'
-            assert finish_job(job) == 0
-            assert 'hello world' in tty.term.text()
-            assert mirror.contents().strip() == 'hello world'
+        s = await _boot(sh, cwd='/tmp')
+        res, _ = await _run(s, 'cd /Users && TP_X=7')
+        assert res == ('prompt', 0, '/Users')
+        res, out = await _run(s, 'echo "$TP_X in $PWD"')
+        assert res[0] == 'prompt' and out == '7 in /Users'   # output only: no command echo
+        res, _ = await _run(s, 'false')
+        assert res[1] == 1
+        await _quit(s)
     asyncio.run(go())
 
-def test_exit_code():
-    async def go():
-        job = spawn_job('exit 3', sh=SH)
-        assert await asyncio.wait_for(relay_job(job), 10) == 'eof'
-        assert finish_job(job) == 3
-    asyncio.run(go())
+def test_shell_bash(): _shell_roundtrip('bash')
+def test_shell_zsh(): _shell_roundtrip('zsh')
 
-def test_stdin_relay_via_master():
-    "Input written to the master reaches the job (tests drive the master directly; the app passes in_fd)."
+def test_shell_own_job_control():
+    "fg/bg/jobs/ctrl-Z are the shell's builtins: stop a child, see it in `jobs`, resume and end it."
     async def go():
-        tty = FakeTty(40, 10)
-        job = spawn_job('cat', sh=SH, size=(40, 10))
-        task = asyncio.ensure_future(relay_job(job, tty.write))
-        await asyncio.sleep(0.2)
-        os.write(job.master_fd, b'hi there\n')
-        await asyncio.sleep(0.2)
-        os.write(job.master_fd, b'\x04')  # ^D: canonical-mode EOF ends cat
-        assert await asyncio.wait_for(task, 10) == 'eof'
-        assert finish_job(job) == 0
-        assert 'hi there' in tty.term.text()
-    asyncio.run(go())
-
-def test_suspend_cont_and_signal_exit():
-    "^Z through the pty line discipline stops the job; cont + re-relay resumes; signal exits decode negative."
-    async def go():
-        job = spawn_job('sleep 30', sh=SH, size=(40, 10))
-        task = asyncio.ensure_future(relay_job(job))
-        await asyncio.sleep(0.2)
-        os.write(job.master_fd, b'\x1a')
-        assert await asyncio.wait_for(task, 10) == 'stopped'
-        assert job.state == 'stopped'
-        job.cont()
-        task = asyncio.ensure_future(relay_job(job))
-        await asyncio.sleep(0.2)
-        os.killpg(job.pgid, signal.SIGTERM)
-        assert await asyncio.wait_for(task, 10) == 'eof'
-        assert finish_job(job) == -signal.SIGTERM
+        s = await _boot()
+        os.write(s.master_fd, b'sleep 30\n')
+        await asyncio.sleep(0.4)
+        os.write(s.master_fd, b'\x1a')                       # ^Z: the shell stops it and prompts (= boundary)
+        assert (await asyncio.wait_for(relay_shell(s), 15))[0] == 'prompt'
+        res, out = await _run(s, 'jobs')
+        assert 'sleep 30' in out
+        os.write(s.master_fd, b'fg\n')
+        await asyncio.sleep(0.4)
+        os.write(s.master_fd, b'\x03')                       # ^C ends the resumed child
+        res = await asyncio.wait_for(relay_shell(s), 15)
+        assert res[0] == 'prompt' and res[1] != 0            # 130: died by SIGINT
+        await _quit(s)
     asyncio.run(go())
 
 def test_altscreen_erases_itself_from_residue():
     "Jeremy's vim rule needs no detection: the emulator's alt-screen semantics drop it from contents()."
     async def go():
-        with pyghostty.Terminal(60, 12) as mirror:
-            job = spawn_job(r"printf '\033[?1049hSECRET DRAWING\033[?1049l'; echo visible after", sh=SH, size=(60, 12))
-            assert await asyncio.wait_for(relay_job(job, mirror=mirror), 10) == 'eof'
-            assert finish_job(job) == 0
-            resid = mirror.contents()
-            assert 'visible after' in resid and 'SECRET' not in resid
+        s = await _boot()
+        res, out = await _run(s, r"printf '\033[?1049hSECRET DRAWING\033[?1049l'; echo visible after")
+        assert res[0] == 'prompt'
+        assert 'visible after' in out and 'SECRET' not in out
+        await _quit(s)
     asyncio.run(go())
 
-def test_bg_drains_without_stall():
-    "The ipythonng gap-1 regression: a chatty bg job must not stall on a full pty buffer."
+def test_chatty_output_never_stalls():
+    "The old bg-stall regression, shell edition: a huge burst relays through a headless mirror without deadlock."
     async def go():
-        with pyghostty.Terminal(80, 24, scrollback=100_000) as mirror:
-            job = spawn_job('seq 1 20000', sh=SH, size=(80, 24))
-            exits = []
-            res = await asyncio.wait_for(watch_job(job, mirror, lambda j, r: exits.append(r)), 30)
-            assert res == 'eof' and exits == ['eof']
-            assert finish_job(job) == 0
-            assert sum(map(len, job.captured)) > 64 * 1024  # more than a pty buffer's worth flowed
-            assert mirror.contents().splitlines()[-1] == '20000'
+        s = await _boot()
+        with pyghostty.Terminal(80, 24, scrollback=100_000) as m:
+            os.write(s.master_fd, b'seq 1 20000\n')
+            res = await asyncio.wait_for(relay_shell(s, mirror=m), 30)
+            assert res[0] == 'prompt' and res[1] == 0
+            assert m.contents().splitlines()[-1] == '20000'
+        await _quit(s)
     asyncio.run(go())
 
-def test_resize_reaches_job():
-    "Job.resize sets the pty winsize; a subsequent size query inside the job sees it."
+def test_resize_reaches_shell_children():
+    "Job.resize sets the pty winsize; a command inside the shell sees the new size."
     async def go():
-        tty = FakeTty(50, 12)
-        job = spawn_job('sleep 0.4; stty size', sh=SH, size=(50, 12))
-        task = asyncio.ensure_future(relay_job(job, tty.write))
-        await asyncio.sleep(0.15)
-        job.resize(97, 41)
-        assert await asyncio.wait_for(task, 10) == 'eof'
-        assert finish_job(job) == 0
-        assert '41 97' in tty.term.text()  # stty reports rows cols
+        s = await _boot(size=(50, 12))
+        s.resize(97, 41)
+        res, out = await _run(s, 'stty size')
+        assert res[0] == 'prompt' and '41 97' in out          # stty reports rows cols
+        await _quit(s)
     asyncio.run(go())

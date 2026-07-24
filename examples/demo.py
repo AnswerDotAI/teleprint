@@ -48,7 +48,7 @@ def main():
             data = t.read(timeout=0.2)  # short poll: SIGWINCH does not wake select (PEP 475 retries it)
             if resized:
                 resized.clear()
-                comp.resize()  # width rewrap killed the map: everything demotes
+                comp.resize()  # width rewrap invalidated the map: everything demotes
                 comp.set_tail(Text(f'resized to {comp.cols}x{comp.rows} -- old blocks are history, ctrl-L revives recent ones', style='reverse'), Text('> '))
                 block('printed after the resize, so this one is live\n(and toggleable)')
             if b'q' in data: break

@@ -14,14 +14,14 @@ def test_insert_and_move():
     press(b, 'left', 'left', 'ctrl+b'); assert b.cursor == 2
     press(b, 'ctrl+f'); assert b.cursor == 3
 
-def test_delete_and_kill():
+def test_delete_and_cut():
     b = Buffer('hello world')
     press(b, 'ctrl+w')
-    assert b.text == 'hello ' and b.kill == 'world'
+    assert b.text == 'hello ' and b.cut == 'world'
     press(b, 'ctrl+y')
     assert b.text == 'hello world'
     press(b, 'ctrl+u')
-    assert b.text == '' and b.kill == 'hello world'
+    assert b.text == '' and b.cut == 'hello world'
     b2 = Buffer('abc'); b2.cursor = 1
     press(b2, 'ctrl+k'); assert b2.text == 'a'
     press(b2, 'backspace'); assert b2.text == ''

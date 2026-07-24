@@ -32,7 +32,7 @@ class Ctl:
 STR_KINDS = {0x5d: 'osc', 0x5f: 'apc', 0x50: 'dcs', 0x5e: 'pm', 0x58: 'sos'}
 MAX_CTL = 1 << 20  # a runaway unterminated control string gets dropped rather than buffered forever
 
-C0 = {0x0d:'enter', 0x0a:'ctrl+j', 0x09:'tab', 0x7f:'backspace', 0x00:'ctrl+space'}
+C0 = {0x0d:'enter', 0x0a:'enter', 0x09:'tab', 0x7f:'backspace', 0x00:'ctrl+space'}
 CSI_FINAL = {'A':'up','B':'down','C':'right','D':'left','H':'home','F':'end','Z':'shift+tab'}
 CSI_TILDE = {1:'home',2:'insert',3:'delete',4:'end',5:'pageup',6:'pagedown',7:'home',8:'end'}
 SS3 = {'A':'up','B':'down','C':'right','D':'left','H':'home','F':'end','P':'f1','Q':'f2','R':'f3','S':'f4'}
@@ -65,9 +65,11 @@ class Parser:
     def __init__(self):
         self._buf = b''
         self._paste = None  # bytes collected so far when inside a bracketed paste
+        self._armed = False  # set by flush on first sight of a pending ESC; new bytes disarm
 
     def feed(self, data):
         if isinstance(data, str): data = data.encode()
+        if data: self._armed = False
         self._buf += data
         out = []
         while self._buf:
@@ -91,10 +93,17 @@ class Parser:
         return out
 
     def flush(self):
-        "Resolve a buffered leading ESC as the escape key (call after a read timeout)."
+        """Resolve a buffered leading ESC as the escape key, arming on the first call and firing on
+        the second (call after a read timeout). One-call resolution shattered escape sequences whose
+        tail was still in flight -- a late CPR reply became composer text -- so only an ESC still
+        pending across two full timeouts resolves; any new bytes disarm."""
         if not self._buf.startswith(b'\x1b'): return []
+        if not self._armed:
+            self._armed = True
+            return []
         rest = self._buf[1:]
         self._buf = b''
+        self._armed = False
         return [Key('escape')] + self.feed(rest)
 
     def _parse1(self):
@@ -112,6 +121,9 @@ class Parser:
             if len(buf) < 3: return None, 0
             k = SS3.get(chr(buf[2]))
             return (Key(k) if k else None), 3
+        # Control strings win over alt-chords: ESC ] P X ^ _ introduce OSC/DCS/SOS/PM/APC, so
+        # alt+], alt+P, alt+X, alt+^, alt+_ can never be bindings -- the price of guaranteeing a
+        # terminal reply never leaks into the composer as keystrokes.
         if buf[1] in STR_KINDS: return self._str_seq(buf)
         b1 = buf[1]
         if b1 == 0x1b: return Key('escape'), 1  # ESC ESC: first one is real

@@ -1,11 +1,11 @@
-"Test harness: a fake tty backed by pyghostty's emulator, for headless compositor tests."
+"Test harness: an emulated tty backed by pyghostty, for headless compositor tests."
 from collections import deque
 from pyghostty import Terminal, ffi, lib
 from pyghostty._ffi import check
 
-class FakeTty:
+class EmuTty:
     """The app's side of a terminal, emulated: writes feed a headless Ghostty, reads
-    return injected input plus the emulator's own query responses (CPR, DECRQM, ...).
+    return seeded input plus the emulator's own query responses (CPR, DECRQM, ...).
 
     The write/read/size/flush surface is the draft borrow-contract tty interface:
     whatever owns the terminal at a given moment holds exactly this object."""
@@ -29,12 +29,12 @@ class FakeTty:
     def cooked(self): pass
 
     def read(self):
-        "All pending input bytes (injected and emulator responses), b'' when none."
+        "All pending input bytes (seeded and emulator responses), b'' when none."
         out = b''.join(self._input)
         self._input.clear()
         return out
 
-    def inject(self, data):
+    def seed(self, data):
         "Test-side: queue bytes as if sent by the terminal (keys, mouse, paste)."
         if isinstance(data, str): data = data.encode()
         self._input.append(data)

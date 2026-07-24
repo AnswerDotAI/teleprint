@@ -1,4 +1,4 @@
-"The real-terminal side of the tty interface: `RealTty` matches `testing.FakeTty`'s surface."
+"The real-terminal side of the tty interface: `RealTty` matches `testing.EmuTty`'s surface."
 import os, select, sys, termios, tty as _tty
 
 class RealTty:
@@ -9,7 +9,7 @@ class RealTty:
     output), ICRNL (Enter arrives as \\r, distinct from ctrl-J), and set VMIN=1
     (Solaris-family defaults it to 4 via the VEOF slot). ISIG is left on: ctrl-C
     still interrupts, which an early-stage app usually wants; clear it when the
-    app takes over interrupt semantics."""
+    app handles interrupts itself."""
     def __init__(self):
         self.fd = sys.stdin.fileno()
         self._saved = termios.tcgetattr(self.fd)

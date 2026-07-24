@@ -4,7 +4,7 @@ from rich.cells import cell_len
 class Buffer:
     "An editable line: `handle` consumes editing keys, returning True when it did."
     def __init__(self, text=''):
-        self.text, self.cursor, self.kill = text, len(text), ''
+        self.text, self.cursor, self.cut = text, len(text), ''
         self.suggestion = ''  # ghost-text tail: shown dim after the cursor, accepted by right/ctrl+e at end
 
     def insert(self, s):
@@ -26,8 +26,8 @@ class Buffer:
         while i < n and self.text[i].isalnum(): i += 1
         return i
 
-    def _kill(self, start, end):
-        self.kill = self.text[start:end]
+    def _cut(self, start, end):
+        self.cut = self.text[start:end]
         self.text = self.text[:start] + self.text[end:]
         self.cursor = start
 
@@ -66,10 +66,10 @@ class Buffer:
                 self.cursor -= 1
         elif k in ('delete','ctrl+d'):
             if self.cursor < n: self.text = self.text[:self.cursor] + self.text[self.cursor+1:]
-        elif k == 'ctrl+k': self._kill(self.cursor, n)
-        elif k == 'ctrl+u': self._kill(0, self.cursor)
-        elif k in ('ctrl+w','alt+backspace'): self._kill(self._back_word(), self.cursor)
-        elif k == 'ctrl+y': self.insert(self.kill)
+        elif k == 'ctrl+k': self._cut(self.cursor, n)
+        elif k == 'ctrl+u': self._cut(0, self.cursor)
+        elif k in ('ctrl+w','alt+backspace'): self._cut(self._back_word(), self.cursor)
+        elif k == 'ctrl+y': self.insert(self.cut)
         else: return False
         return True
 
