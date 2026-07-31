@@ -147,12 +147,12 @@ class Compositor:
         return line
 
     def _block_lines(self, blk, live=None):
-        "Content-first presentation rows: gutter + body lines; collapsed shows line one plus a dim count."
+        "Content-first presentation rows: gutter + body lines (a padded block leads with one blank row); collapsed shows line one plus a dim count."
         lines = self._content_lines(blk)
         if live is None: live = len(lines) > 1
         else: live = live and len(lines) > 1
         first_g, cont_g = blk.gutter
-        out = []
+        out = [(blk.id, [])] if blk.pad else []
         shown = lines[:1] if blk.collapsed else lines
         for i, segs in enumerate(shown):
             g = self._gutter_segs(first_g if i == 0 else cont_g, live, blk.id)
@@ -194,7 +194,7 @@ class Compositor:
 
     def _number(self, rows, ws):
         """Assign digits 0..9 to the newest visible toggleable blocks, newest first, substituting
-        each block's first row with its numbered form. Digits ink as displayed (rule 2 stays
+        each block's first content row (past any pad row) with its numbered form. Digits ink as displayed (rule 2 stays
         pure). A straddler whose first row has already inked wears no digit; one-liners have
         nothing to toggle and are skipped without consuming a digit."""
         self.numbered = {}
@@ -204,10 +204,10 @@ class Compositor:
             start, cnt = self._spans[bid]
             if start + cnt <= ws: break   # this block and everything older sit above the window
             blk = self.blocks[bid]
-            if blk.height <= 1 or start < ws: continue
+            if blk.height <= 1 or start + blk.pad < ws: continue
             e = self._numbered_row(blk, d)
             if e is None: continue
-            rows[start] = e
+            rows[start + blk.pad] = e
             self.numbered[str(d)] = bid
             d += 1
 
@@ -266,9 +266,9 @@ class Compositor:
         self._painted[y] = ansi
 
     # -- public operations ----------------------------------------------------
-    def print_block(self, body=None, gutter=None, tag=None, collapse_at=None, source=None):
+    def print_block(self, body=None, gutter=None, tag=None, collapse_at=None, source=None, pad=False):
         "Append a block to the document (auto-collapsed when born over its threshold) and repaint."
-        blk = Block(self._next_id, body, gutter=gutter, tag=tag, collapse_at=collapse_at, source=source)
+        blk = Block(self._next_id, body, gutter=gutter, tag=tag, collapse_at=collapse_at, source=source, pad=pad)
         self._next_id += 1
         self.blocks[blk.id] = blk
         self._content_lines(blk)  # measure, so the collapse threshold applies before first paint
