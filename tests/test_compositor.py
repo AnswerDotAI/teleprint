@@ -546,3 +546,17 @@ def test_remove_block():
     assert b.id not in comp.blocks and b.id not in comp._epoch
     assert parked(tty, comp)
     comp.toggle(keep) if keep.height > 1 else None  # the survivors still behave (no stale spans)
+
+def test_pad_block():
+    "pad renders one leading blank presentation row; the digit stays on the content row; the pad is never content."
+    tty, comp = make(40, 12)
+    comp.numbering = True
+    comp.set_tail('> ')
+    comp.print_block('before', gutter=G3)
+    b = comp.print_block('one\ntwo', gutter=G3, pad=True)
+    scr = tty.term.text().splitlines()
+    assert scr[:4] == ['»»» before', '', '»0» one', '··· two']
+    assert b.height == 2
+    comp.toggle(b)
+    assert tty.term.text().splitlines()[2] == '»0» one … (+1 lines)'
+    assert parked(tty, comp)

@@ -14,9 +14,10 @@ class Block:
     app label (never rendered). `collapse_at` auto-collapses the block when its
     rendered height crosses the threshold (None: never). `source` is the model-level
     text behind the rendering (a cell's code, a reply's markdown): what search matches
-    and copy yields; None falls back to plain-text extraction from the rendering."""
-    def __init__(self, bid, body=None, gutter=None, tag=None, collapse_at=None, source=None):
-        self.id, self.tag, self.collapse_at, self.source = bid, tag, collapse_at, source
+    and copy yields; None falls back to plain-text extraction from the rendering. `pad` renders one leading
+    blank row: presentation-only turn spacing, never part of the content."""
+    def __init__(self, bid, body=None, gutter=None, tag=None, collapse_at=None, source=None, pad=False):
+        self.id, self.tag, self.collapse_at, self.source, self.pad = bid, tag, collapse_at, source, pad
         self.body = [] if body is None else [body]
         self.gutter = gutter or (Text(''), Text(''))
         self.collapsed = False
