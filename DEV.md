@@ -76,15 +76,14 @@ An alt-screen, deliberately-entered live projection of the block model — enter
 **Hide and pin (built; the first dialog-editing operation).** `skipped` and `pinned` are base-`Message`
 fields in aidialog (solveit's literal metadata keys, so files mean the same thing in every host):
 `skipped` hides a message from the AI -- `dlg2hist` drops it from every projection -- and `pinned` marks
-it for whatever eviction policy a host runs (solveit's `limit_msgs` keeps pinned; ipyai's eviction is
-still ahead). In ipyai, `h` on the transcript-view cursor block flips `skipped` for the block's whole
+it for whatever context policy a host runs (solveit's `limit_msgs` eviction keeps pinned; ipyai
+will compact rather than evict -- deferred, llmsurgery-based). In ipyai, `h` on the transcript-view cursor block flips `skipped` for the block's whole
 exchange -- one exchange (input + outputs, or ask + reply + tool calls) is ONE dialog message, so both
 halves go together by construction. Every block printed for an exchange is stamped with its message id
 at record time (`_stamp_exchange`); hidden exchanges render dim on both surfaces (`Block.dim`, a
-self-invalidating property). Persistence: `%ipyai save`/`load` ride the meta_attrs round-trip for free;
-the sqlite store has a `meta` column (added in place to old dbs) updated on toggle, session-qualified
-because a resumed instance writes new work under its own session id while toggles on resumed messages
-must update the source session's rows. The ctx meter reflects a hide only after the next turn: it
+self-invalidating property). Persistence: `%ipyai save`/`load` ride the meta_attrs round-trip for
+free, and a toggle just saves the session dialog whole, like every other event. The ctx meter
+reflects a hide only after the next turn: it
 reports the API's measured usage, not an estimate.
 
 Copy-mode and the transcript view divide labor: **copy-mode = the archive** (complete, searchable, inert), **transcript view = the live view** (compact, clickable, in-place). Same document, two projections.
@@ -109,7 +108,7 @@ UI process + execution kernel subprocess, from day one (clikernel was in-proc on
 - The transcript outlives the kernel: restart/crash is just an event block; model, history, scrollback intact. Interrupt is a signal to the kernel on a keybinding; the tail never freezes.
 - One event model: kernel events, pty job bytes, input, resize — one asyncio loop reading fds, updating the model, repainting.
 
-The wire is the Jupyter protocol — but NOT jupyter_console, which was always the painful layer in classic ipyai (the ZMQTerminalIPythonApp subclass, the pt coupling, the iopub tee); the wire is adopted, the framework is not. This was settled by experiment: a minimal custom stream protocol was built first and, one op at a time, turned out to be re-implementing Jupyter's vocabulary — `complete` (= complete_request), `check` (= is_complete_request), `inspect` (= inspect_request), then unsolicited events (= iopub), display-id updates (= update_display_data), and a live event loop between cells (= the kernel architecture itself: OS threads advance between serial requests but asyncio tasks freeze, and a background thread's print lands in the protocol pipe). Stack: **teleprint** (tty half, wire-agnostic) + **conkernelclient** (published lib: concurrent-safe AsyncKernelClient with demuxed replies — which also un-fences completion/inspection *during* execution) + **ipymini** (the kernel; owning both ends retires the fighting-other-frameworks objection). Stolen from the conkernel experiment: `ModuleKernelManager` (kernelspec-free `python -m ipymini -f {connection_file}` launch) and the liveness-polled execute pattern (ZMQ death is silent: no EOF, the reply just never comes). Incremental iopub consumption — rendering messages to blocks as they arrive — is the one piece that is ours alone.
+The wire is the Jupyter protocol — but NOT jupyter_console, which was always the painful layer in classic ipyai (the ZMQTerminalIPythonApp subclass, the pt coupling, the iopub tee); the wire is adopted, the framework is not. This was settled by experiment: a minimal custom stream protocol was built first and, one op at a time, turned out to be re-implementing Jupyter's vocabulary — `complete` (= complete_request), `check` (= is_complete_request), `inspect` (= inspect_request), then unsolicited events (= iopub), display-id updates (= update_display_data), and a live event loop between cells (= the kernel architecture itself: OS threads advance between serial requests but asyncio tasks freeze, and a background thread's print lands in the protocol pipe). Stack: **teleprint** (tty half, wire-agnostic) + **jupygate** + **jupyasyncclient** (the gateway hosts the kernels over HTTP/WS -- kernels outlive the app, enabling attach and warm resume -- and the async client demuxes replies, un-fencing completion/inspection *during* execution; conkernelclient played this role pre-gateway) + **ipymini** (the kernel; owning both ends retires the fighting-other-frameworks objection). Stolen from the conkernel experiment: `ModuleKernelManager` (kernelspec-free `python -m ipymini -f {connection_file}` launch) and the liveness-polled execute pattern (ZMQ death is silent: no EOF, the reply just never comes). Incremental iopub consumption — rendering messages to blocks as they arrive — is the one piece that is ours alone.
 
 The tty seam: interactive commands (`!vim`) run UI-side where the tty lives; capture-only execution stays kernel-side; cwd crosses (queried from the kernel per job spawn). Kernel outputs are nbformat-shaped (stream/display_data/execute_result/error) — already the block model's input; we render typed.
 
@@ -125,7 +124,7 @@ The screen is a projection of the model; scrollback is a write-once record. Four
 Paint state is two integers — `top` (screen row of the region origin, worn down to 0 as scrolls absorb the shell's rows) and `ws` — plus the per-frame row→target click map. Carried over from the old model:
 
 - **Rich is render-only.** Renderable -> segments -> ANSI; the compositor is the only animator; rich.live stays excluded.
-- **No printed identity.** Nothing re-parses scrollback (the transcript view reads the model; resume reads the db), so blocks print no id.
+- **No printed identity.** Nothing re-parses scrollback (the transcript view reads the model; resume reads the session file), so blocks print no id.
 - **Content renders at `cols - gutter_width`** and every composed row is clipped to `cols`: one row is one screen row, never a wrap (see the width lesson under Development loop).
 - Synchronized-output brackets (mode 2026, where probed) make each frame atomic.
 
@@ -146,7 +145,7 @@ computation, and the class is gone (test_transients_grow_a_young_region pins it)
 Two pieces; the boundary rule: **teleprint knows blocks, surfaces, and the terminal; it must never contain the nouns "model", "tool call", "session", or "IPython".**
 
 - **teleprint** (this lib): borrow contract, input parser, compositor (write-once frame engine: ink-on-growth, transients, click map), buffer/tail editor, transcript view, widgets, the shell layer. Block concept minimal: identity, Rich-renderable forms, click targets, `source` (model-level text for search/copy). kittytgp optional. Headless-testable: feed escape sequences, assert the emulated screen (per-cell styles included, via `EmuTty.term.style`).
-- **ipyai** (continues under its name; experimental, few users, so clean breaks are cheap): block types and gutters, fastllm model wiring, sqlite sessions, magics, ctx management, mime renderers. It lives on branch `ipyaing`, landing as one clean-break merge deleting the pt/jupyter_console implementation; git main keeps classic ipyai daily-drivable until then.
+- **ipyai** (continues under its name; experimental, few users, so clean breaks are cheap): block types and gutters, fastllm model wiring, session files (dialog `.ipynb`s under `./.ipyai/sessions/`), magics, ctx management, mime renderers. It lives on branch `ipyaing`, landing as one clean-break merge deleting the pt/jupyter_console implementation; git main keeps classic ipyai daily-drivable until then.
 
 Extraction rule: design as-if-extractable (clean imports, no host reach-arounds), extract on the second consumer. A terminal renderer for solveit dialogs is the likely second consumer and near-demo.
 
@@ -180,14 +179,16 @@ the last resort.
 
 ## Transcript persistence
 
-Outputs persist client-side from the block model (richer than kernel-side repr flattening: exact streams, error structures, real PNG bytes), one row per cell, the value being the cell's outputs as a verbatim **nbformat outputs JSON array** (the iopub dicts we already consume -- zero schema invention, and export-to-ipynb or to a solveit Dialog is nearly a SELECT). Storage: **IPython's own history.sqlite, extended with our tables** (Jeremy: reuse the db, add tables -- old ipyai's claude_prompts already lived alongside the history/sessions tables), so `(session, line)` references are real same-db joins against the kernel's numbering. Rules: prefix new tables (`ipyai_*`) against future IPython schema collisions; NEVER flip the db's journal mode (WAL persists and it is the kernel's file first); writers use busy timeouts and short transactions (the kernel's HistorySavingThread is a concurrent writer); write at cell completion. Images are capped at 2M pixels per image at persist time (`_cap_images`; display stays full size). Kernel-side `db_log_output`/ipythonng flattening stays OFF for ipyaing: that machinery answers vanilla terminal IPython's needs, not a block-model app's ('%history -o' in-kernel parity is the one thing forgone).
+The session IS its file: one dialog `.ipynb` per session under `./.ipyai/sessions/` (uuid names, a self-excluding `.gitignore`), written whole and atomically on every event (aidialog's `write_ipynb`) -- solveit's model exactly, so a session file opens in Jupyter or solveit as-is. Outputs persist client-side from the block model (richer than kernel-side repr flattening: exact streams, error structures, real PNG bytes) as verbatim **nbformat outputs** on each message. The kernel id, model, and think level ride in the notebook metadata: resume warm-attaches the stamped kernel when it is still alive. History navigation and ghost suggestions mine this directory's session files per mode; IPython's `history.sqlite` and the old `ipyai_*` tables are out of the picture entirely (superseded 2026-08: the gateway made kernel-side storage wrong -- a shared or remote kernel's db is not ours to write).
 
 ## ipyai assistant wiring
 
 The session IS a Dialog (aidialog): `add_cell` appends code/note messages (bare-string cells
 become markdown notes; outputs are verbatim nbformat), `run_prompt` appends a prompt message and
-sets its output to the reply. Ctx = `dlg2hist`; `$`var``/`!`cmd`` expansions are extra str parts
-prepended to the final prompt's parts. On backend failure the pending prompt message is removed
+sets its output to the reply. Ctx = `dlg2hist`; `$`var``/`!`cmd`` refs both evaluate in the
+kernel at turn time (! via the kernel's own `getoutput`: stdout+stderr, kernel cwd, `var_expand`
+interpolation) and merge into one synthetic variables turn at the
+top of history (aidialog's `vars_hist`). On backend failure the pending prompt message is removed
 so a retry cannot double it (regression-tested).
 
 One stream, two consumers: the AsyncChat stream tees into fastllm's AsyncStreamFormatter
@@ -311,39 +312,24 @@ shell; immediacy makes this serve both "bad reply" and "typo'd cell") and `E` in
 view recalls any prompt (prompts only: reaching back is a conversation rewind; old code has no
 honest re-run story). Both fill the composer, switch the mode to match, and show a `↻` status
 cell. A kind-matched submit rewinds first -- the target and everything after it leave the dialog
-(`remove_msgs`), the store (`Store.truncate`: line for cells, rowid for prompts, cross-session
-for resumed dialogs, n_cells rolled back), and the block model (`Compositor.remove_block`; ink in
-scrollback stays, the log is a log) -- then the normal run path appends the fresh turn. A
+(`remove_msgs`) and the block model (`Compositor.remove_block`; ink in scrollback stays, the log
+is a log), and the save that follows writes the truncated dialog whole -- then the normal run
+path appends the fresh turn. A
 mismatched-kind submit or Esc disarms (truncating as a side effect of unrelated code would be a
 footgun). No dim, no orphan bookkeeping: the window shows the model as it now stands (Jeremy's
 call, overruling my dim-the-orphans lean -- dim means hidden, not deleted). `alt-up` keeps its
 existing force-history binding; retry lives on `alt-r`. Record surgery vs time travel: `e` edits
 in place with no re-run; `E`/`alt-r` rewind and re-run.
 
-**Directory-scoped sessions (classic behavior to restore; design confirmed 2026-07-23).**
-Classic ipyai scoped everything to the starting directory: `ipyai` in a dir opened that dir's
-session (a chooser when several existed) and restricted history to it. The storage for this
-already exists -- one shared db (`ipyai_*` tables inside the kernel's history.sqlite, same
-session numbers as IPython's `history` table), with `ipyai_sessions.cwd` annotating each
-session id with its directory. That single-db design was chosen exactly so scoping is a JOIN,
-not a second store. To build:
-
-- *Startup*: plain `ipyai` looks up `sessions(cwd=os.getcwd())`. None -> fresh session (as now).
-  One -> resume it. Several -> numbered chooser (the `--sessions` table: id, prompt count, last
-  prompt preview); empty Enter picks the newest, `n` starts fresh. `-r N` and `--sessions` stay
-  as the explicit forms; a `--new` flag forces fresh without a prompt.
-- *History scoping*: `History.refresh` gains the cwd JOIN --
-  `SELECT source_raw FROM history WHERE session IN (SELECT session FROM ipyai_sessions WHERE
-  cwd = ?) ORDER BY session DESC, line DESC` -- so arrow-nav and ghost suggestions draw only on
-  this directory's sessions (resumed or fresh alike; a fresh session's own lines arrive via
-  add_local + refresh as now). Unannotated sessions (ipymini test runs, bare IPython) fall
-  outside the JOIN, which also kills the junk-suggestion symptom (old `input()` test lines
-  ghost-suggested in unrelated dirs). History is also mode-scoped: each composer mode
-  navigates its own past -- code from the kernel's history table, prompt from ipyai_prompts,
-  shell from the recorded `!` cells -- disjoint sources, all under the same cwd JOIN
-  (see History.refresh).
-- *Settled*: the chooser is cwd-only (no other-directory escape hatch; `-r N` covers that rare
-  case) and renders as an in-flow `over` transient at startup: it evaporates without inking.
+**Directory-scoped sessions (BUILT 2026-08, via session files; supersedes the sqlite-JOIN design
+of 2026-07-23).** Sessions live where they happen: one dialog `.ipynb` per session under the
+launch directory's `./.ipyai/sessions/`, so directory scoping is just the filesystem -- no shared
+db, no cwd JOIN. Plain `ipyai` always starts fresh; bare `-r` opens the chooser over this
+directory's files (digits choose, empty Enter picks the newest, `n` starts fresh), `-r PREFIX`
+resumes one by filename. History and ghost suggestions mine the same files, mode-scoped (code
+cells / prompts / shell cells per composer mode), so unrelated kernels' lines never leak in --
+the junk-suggestion symptom died with the shared db. The chooser stays cwd-only and renders as an
+in-flow `over` transient at startup: it evaporates without inking.
 
 **Jobs work: superseded.** The per-command jobs machinery (and its planned %jobs/M-j additions)
 was replaced wholesale by the persistent shell -- see "Shell layer". Being built now.
