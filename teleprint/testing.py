@@ -27,6 +27,7 @@ class EmuTty:
     def flush(self): pass
     def raw(self): pass      # borrow-mode termios changes have no headless equivalent
     def cooked(self): pass
+    def restore(self): pass  # termios restore has no headless equivalent either
 
     def read(self):
         "All pending input bytes (seeded and emulator responses), b'' when none."

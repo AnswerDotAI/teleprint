@@ -7,7 +7,7 @@ The pieces:
 - a compositor that prints Rich-renderable blocks and repaints the visible ones in place (collapse/expand on click)
 - a line editor and a key/mouse/paste input parser
 - transcript mode on the alt screen: browse, search, and copy the block history (copy via OSC 52)
-- a jobs layer: foreground commands borrow the real tty; background jobs run against a headless mirror
+- a borrow layer: foreground commands take the real tty; anything headless runs against an emulator mirror
 - widgets (status bar, signature panel) and a pyghostty-backed terminal emulator, so the whole surface is testable headlessly
 
 The design sections below are the founding notes, moved here verbatim; DEV.md keeps the development record.
@@ -33,6 +33,42 @@ Three surfaces, one rule each:
 - **Ephemeral** (alt screen): pager, pickers, modals. Leave no residue; only an *outcome block* enters the transcript (the decision, printed — like shell history recording the command, not the completion menu). fzf is the exemplar: transient full-screen moments don't make a tool a TUI; identity is where the app rests.
 
 Within the main screen, two zones by mutability: **inked** (scrolled off-screen into the terminal's buffer; written once, immutable) and **visible** (redrawn from the block model on any change, so everything on screen is clickable -- folding a block simply repaints the screen from the model, however long ago it printed). The tail is part of the visible region and never enters history. Interactivity map: everything visible interactive; inked history native and inert (the transcript view for live access); alt-screen surfaces interactive while up.
+
+## Background work, tasks, and errors
+
+A teleprint app is one event loop reading one tty. Key handlers run synchronously -- deciding what a key means takes microseconds and must happen in arrival order -- so anything slow (a kernel round trip, an AI turn) is *launched* from a handler, never awaited inline. The compositor owns the launching. Two rules cover every case, picked by one question: **what do you need back?**
+
+- **Nothing -- it should just happen** -> `comp.spawn(coro)`. In an `on_key` handler, simply `return` the coroutine: the dispatcher spawns it for you.
+- **A handle -- you will cancel it or check on it** -> keep `spawn`'s return value.
+
+```python
+def on_key(k):
+    if k.name == 'tab': return complete()  # fire-and-forget: the dispatcher spawns it
+    elif k.name == 'enter':
+        state['run'] = comp.spawn(run_cell(buf.text), name='run')  # handle kept: ctrl-C cancels it
+    elif k.name == 'ctrl+c' and state['run'] is not None:
+        state['run'].cancel()
+```
+
+Why `spawn` and never a bare `asyncio.create_task` in app code: asyncio holds only weak references to tasks, so a fire-and-forgotten task can be garbage-collected mid-flight, and an uncaught exception surfaces as a deferred "Task exception was never retrieved" splat on stderr -- which in raw mode garbles the composited screen, minutes after the cause. `spawn` keeps a strong reference until the task finishes and routes an uncaught failure to the one place the app chooses:
+
+```python
+comp.on_task_error = lambda e, t: comp.print_block(f'{t.get_name()} failed: {e!r}', gutter=ERR)
+```
+
+Unset, nothing is silenced: `spawn` deliberately does not retrieve the exception then, so asyncio's default report still fires (promptly, since the reference is released on completion). Cancellation is lifecycle, not failure -- a cancelled task never reaches the hook.
+
+The one legitimate bare `create_task` is a task whose exception its owner consumes at an `await` site, where the hook would double-report (ipyai's stream consumer is the canonical case). That code characteristically lives below the UI layer and has no compositor in reach -- so in app code, a bare `create_task` or a dropped handle reads as a bug at a glance.
+
+## Signals
+
+`await comp.start()` takes them; `comp.stop()` gives them back. Apps register nothing:
+
+- **SIGWINCH** -> `comp.on_resize` if set, else adopt-the-size-and-repaint. Set the hook whenever the app owns tail state (every real app does): `comp.on_resize = lambda: (comp.resize(), paint())`. It owns the *whole* response, so during a borrow it can forward the winsize to the foreground job and skip the repaint that would garble the borrowed screen.
+- **SIGINT** -> synthesized as `Key('ctrl+c')` through normal dispatch. RealTty's cbreak keeps ISIG on, so ctrl-C arrives as a signal at rest but as an in-band byte during raw-mode borrows: either way `on_key` sees one `ctrl+c` key, and interrupt policy lives in exactly one branch.
+- **SIGTERM/SIGHUP** -> restore the terminal, then die by the default disposition: a killed TUI must not leave the user's terminal raw.
+
+Signals register only on the main thread (a CPython constraint); elsewhere `start()` skips them silently, which is also why headless tests run unchanged.
 
 ## Why not prompt_toolkit or Textual
 

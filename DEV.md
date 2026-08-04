@@ -250,19 +250,21 @@ special handling: the shell stops the child and prints its prompt, which IS the 
 F2 rides the same borrow with `record=False`: composer text to a temp file, `$EDITOR` runs it
 (resolved from the app's own env -- the pty shell's rc overrides env vars, see edit_buffer),
 clean exit reloads the composer, nonzero (vim's `:cq`) abandons; nothing records.
-Between borrows a background drain pumps the pty into a rolling mirror (bg job output, `[1]
+Between borrows a background drain pumps the channel into a rolling mirror (bg job output, `[1]
 Done` notices); at the next borrow anything drained prints first as a small block. `exit` kills
-the shell: it respawns fresh on next use, with a note. Quit gate: C-D with live shell children
-(a `pgrep -P` check) warns once, listing them; an immediate second C-D quits and the shell's
-process group gets SIGHUP, taking its jobs with it -- exactly a terminal window close.
+the shell: it respawns fresh on next use, with a note. Quit gate: C-D while a shell exists warns
+once (the shell and any jobs in it close with the app); an immediate second C-D quits, and the
+app's teardown deletes the owned terminal, taking its jobs with it -- exactly a terminal window
+close. (The old `pgrep -P` children listing died with the local pty: the shell's process now
+lives in the gateway, so there is no local child list to show.)
 
-Teleprint side: `jobs.py` is now shell-only -- `spawn_shell` (pty.fork session leader, winsize
-at spawn, rc injection), `relay_shell` (asyncio relay to the sentinel), `Job.resize` for
-SIGWINCH, `finish_job`. The old one-shot runner (status pipe, stopped relay, `Job.cont`,
-`relay_job`, `watch_job`) was deleted with its tests when the persistent shell landed: the
-shell does stop/resume itself. The borrow choreography
+Teleprint side: `jobs.py` is gone (2026-08-04). The shell became a jupygate-hosted terminal
+(ptymini pty, ws attach), owned by ipyai and deleted on exit, so the machinery moved to
+`ipyai/shell.py`: `GateShell` carries the same rc/sentinel choreography (it is all in-band, so
+it survived the transport change verbatim) and `relay` keeps `relay_shell`'s exact contract.
+Teleprint keeps only what is genuinely terminal-UI: the borrow choreography
 (`release()`/`reanchor()`/`record_block()`, RealTty `raw()`/`cooked()`) is exactly as before.
-Known env facts, by design: the shell's environment is its own (started from the UI process;
+Known env facts, by design: the shell's environment is its own (spawned by the gateway, with the app's TERM/COLORTERM overlaid;
 cwd flows shell -> kernel via the boundary marker, kernel `%cd` does NOT flow back to the
 shell); kernel-side `!` (embedded forms) sees the kernel's environment.
 

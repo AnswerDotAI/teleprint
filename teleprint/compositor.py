@@ -1,5 +1,5 @@
 "The compositor: renders the visible tail of the block document from the model; scrollback is a write-once record."
-import time
+import asyncio, os, signal, time
 from rich.console import Console
 from rich.cells import cell_len
 from rich.segment import Segment
@@ -19,8 +19,8 @@ class Compositor:
 
     Paint state: `_top` (screen row of the region origin, worn down to 0 as scrolls absorb the
     shell's rows), `_ws` (document rows inked so far), and the per-frame screen map for clicks.
-    The single CPR runs at `start` (and again at `reanchor`, the same synchronous boundary) to
-    learn the origin; it is never asked mid-flight, so there is nothing asynchronous to race."""
+    The single CPR runs at `start` (and again at `reanchor`, the same quiet boundary) to learn
+    the origin; both await it, but nothing else is ever in flight there, so there is no race."""
     def __init__(self, tty):
         self.tty = tty
         self._adopt_size()
@@ -35,12 +35,16 @@ class Compositor:
         self._over = []       # rendered transient entries, laid out directly above the tail; never ink
         self._cursor = (0, 0) # where the last frame parked the visible cursor
         self._parser = Parser()
-        self.on_key = None    # callable(Key)
+        self.on_key = None    # callable(Key); a returned coroutine is scheduled
         self.on_paste = None  # callable(str)
         self.on_ctl = None    # callable(Ctl): OSC/APC/DCS replies and payloads
         self.on_wheel = None  # callable(direction: -1 up, 1 down), e.g. tmux copy-mode delegation
         self.on_mouse = None  # callable(Mouse) -> bool handled: lets a mode take the mouse over click/wheel defaults
         self.on_act = None    # callable(token): a click landed on tail/transient chrome carrying Style(meta={'act': token})
+        self.on_task_error = None  # callable(exc, task): a spawned task failed; unset -> asyncio's default report
+        self.on_resize = None  # callable(): SIGWINCH; unset -> self.resize(). Set it to own the whole response (apps with tail state, borrows)
+        self._tasks = set()   # strong refs to spawned tasks: asyncio's registry holds only weak ones
+        self._signals = []    # signals start() registered on the loop, removed by stop()
         self.numbering = False  # apps opt in: newest visible toggleable blocks wear alt-digit numbers
         self.numbered = {}     # per-frame {digit str: block id}, for the app's alt-digit binding
         self.paused = False   # an alt-screen surface owns the tty (transcript view): frames are model-only until unpause
@@ -60,8 +64,8 @@ class Compositor:
     def _invalidate(self): self._painted = [None] * self.rows
 
     # -- input side -----------------------------------------------------------
-    def _ask_cursor(self, timeout=2.0):
-        "The one CPR round-trip, used only at synchronous boundaries (start, reanchor) where nothing else is in flight."
+    async def _ask_cursor(self, timeout=2.0):
+        "The one CPR round-trip, used only at quiet boundaries (start, reanchor) where nothing else is in flight."
         self.tty.write('\x1b[6n')
         deadline = time.monotonic() + timeout
         while True:
@@ -69,15 +73,59 @@ class Compositor:
                 if isinstance(ev, CPR): return ev.row, ev.col
                 self._dispatch(ev)  # keys typed while we waited are not lost
             if time.monotonic() >= deadline: raise RuntimeError(f'no CPR reply within {timeout}s')
+            await asyncio.sleep(0)  # yield between the short blocking reads: the loop stays live at the boundary
 
-    def start(self):
-        "Adopt the tty: learn the region origin (the shell's cursor row), so launch looks like any CLI program."
-        row, col = self._ask_cursor()
+    async def start(self):
+        "Adopt the tty and the loop: learn the region origin (the shell's cursor row), then take the signals owned here."
+        row, col = await self._ask_cursor()
         if col:
             self.tty.write('\r\n')
             row = min(row + 1, self.rows - 1)
         self._top = row
+        self._register_signals()
         return self
+
+    def stop(self):
+        "Release what start() took from the loop: the signal handlers. Kept task handles stay the app's to cancel."
+        loop = asyncio.get_running_loop()
+        for sig in self._signals: loop.remove_signal_handler(sig)
+        self._signals.clear()
+
+    def spawn(self, coro, name=None):
+        """Schedule background work from sync UI code: create the task, keep it alive (asyncio holds
+        only weak refs), and surface an uncaught failure through `on_task_error` (unset: asyncio's
+        default report). Returns the Task -- keep it iff you will cancel or check it. The one case
+        for a bare `create_task` instead is a task whose exception the owner consumes at an `await`
+        site, where the hook would double-report."""
+        t = asyncio.create_task(coro, name=name)
+        self._tasks.add(t)
+        t.add_done_callback(self._task_done)
+        return t
+
+    def _task_done(self, t):
+        self._tasks.discard(t)
+        if t.cancelled() or self.on_task_error is None: return  # unset: don't retrieve, so asyncio's own report survives
+        if (e := t.exception()) is not None: self.on_task_error(e, t)
+
+    def _register_signals(self):
+        "WINCH -> `on_resize` (unset: adopt+repaint); INT -> a synthetic ctrl-C key, one surface whichever transport; TERM/HUP -> restore the tty, then die by default disposition."
+        loop = asyncio.get_running_loop()
+        hs = ((signal.SIGWINCH, self._on_winch), (signal.SIGINT, lambda: self._dispatch(Key('ctrl+c'))),
+            (signal.SIGTERM, lambda: self._fatal(signal.SIGTERM)), (signal.SIGHUP, lambda: self._fatal(signal.SIGHUP)))
+        for sig, h in hs:
+            try: loop.add_signal_handler(sig, h)
+            except ValueError: return  # signals work only on the main thread; a worker-thread loop just goes without
+            self._signals.append(sig)
+
+    def _on_winch(self):
+        if self.on_resize: self.on_resize()
+        else: self.resize()
+
+    def _fatal(self, sig):
+        "A fatal signal: put the terminal back first, then die by the default disposition so the exit status stays honest."
+        self.tty.restore()
+        signal.signal(sig, signal.SIG_DFL)
+        os.kill(os.getpid(), sig)
 
     def on_bytes(self, data):
         "Parse terminal input and dispatch it: clicks and wheel handled here, keys and pastes go to the `on_key`/`on_paste` hooks."
@@ -96,7 +144,9 @@ class Compositor:
         elif isinstance(ev, Ctl):
             if self.on_ctl: self.on_ctl(ev)
         elif isinstance(ev, Key):
-            if self.on_key: self.on_key(ev)
+            if self.on_key:
+                r = self.on_key(ev)
+                if asyncio.iscoroutine(r): self.spawn(r)  # a handler may return a coroutine: the async action it wants scheduled
         elif isinstance(ev, Paste):
             if self.on_paste: self.on_paste(ev.text)
 
@@ -394,7 +444,7 @@ class Compositor:
         self._top = y
         self._invalidate()
 
-    def reanchor(self):
+    async def reanchor(self):
         "End a borrow: whatever the borrower painted is history now; adopt the (possibly new) size and learn a fresh origin -- the startup move again."
         self._adopt_size()
         for b in self.blocks.values(): b.committed = True
@@ -403,7 +453,7 @@ class Compositor:
         self._tail = []
         self._over = []
         self._tail_cursor = None
-        row, col = self._ask_cursor()
+        row, col = await self._ask_cursor()
         if col:
             self.tty.write('\r\n')
             row = min(row + 1, self.rows - 1)

@@ -7,14 +7,14 @@ from teleprint.transcript import TranscriptView
 
 G = (Text('» ', style='green'), Text('  '))
 
-def make(cols=32, rows=8):
+async def make(cols=32, rows=8):
     tty = EmuTty(cols, rows)
-    comp = Compositor(tty).start()
+    comp = await Compositor(tty).start()
     comp.set_tail('> ')
     return tty, comp
 
-def test_transcript_browse_toggle_and_leave():
-    tty, comp = make()
+async def test_transcript_browse_toggle_and_leave():
+    tty, comp = await make()
     bs = [comp.print_block(f'top {i}\nbot {i}', gutter=G) for i in range(6)]
     main_before = tty.term.text()
     tv = TranscriptView(comp, lambda: ([Text('[transcript]')], None))
@@ -31,8 +31,8 @@ def test_transcript_browse_toggle_and_leave():
     tv.leave()
     assert tty.term.text() == main_before                  # main screen untouched: alt leaves no residue
 
-def test_transcript_composer_cursor_and_resync():
-    tty, comp = make()
+async def test_transcript_composer_cursor_and_resync():
+    tty, comp = await make()
     b1 = comp.print_block('alpha\nbeta', gutter=G)
     b2 = comp.print_block('gamma\ndelta', gutter=G)
     buf = ['']
@@ -53,8 +53,8 @@ def test_transcript_composer_cursor_and_resync():
 
 def K(ch): return Key(ch, ch)
 
-def test_transcript_search_motion_copy():
-    tty, comp = make(cols=40, rows=10)
+async def test_transcript_search_motion_copy():
+    tty, comp = await make(cols=40, rows=10)
     b0 = comp.print_block('alpha\nhidden needle here', gutter=G)
     b1 = comp.print_block('beta\nsecond needle', gutter=G)
     b2 = comp.print_block('gamma\ndelta', gutter=G, source='SRC = gamma')
@@ -92,8 +92,8 @@ def test_transcript_search_motion_copy():
     b64 = base64.b64encode(b'SRC = gamma').decode()
     assert any(isinstance(d, str) and d.startswith('\x1b]52;c;' + b64) for d in writes)
 
-def test_transcript_compose_focus():
-    tty, comp = make()
+async def test_transcript_compose_focus():
+    tty, comp = await make()
     comp.print_block('alpha\nbeta', gutter=G)
     tv = TranscriptView(comp, lambda: ([Text('> ')], (0, 2)))
     tv.enter()
@@ -106,9 +106,9 @@ def test_transcript_compose_focus():
     assert tv.on_key(K('i'))                     # explicit compose entry
     assert tv.composing
 
-def test_follow_mode_and_paused_frames():
+async def test_follow_mode_and_paused_frames():
     "Enter follows the tail; blocks printed during the view stream into it (main-screen frames stay model-only); navigation unpins, G re-pins; leave paints the backlog once."
-    tty, comp = make()
+    tty, comp = await make()
     comp.print_block('first', gutter=G)
     tv = TranscriptView(comp, lambda: ([Text('[t]')], None))
     tv.enter()

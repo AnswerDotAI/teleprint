@@ -13,7 +13,7 @@ block, click the [mode] button, `n` adds an exchange, `r` runs a fake cell with 
 `m` modal, `c` completion menu, `x` closes them, `q` quits. Then scroll up (wheel: tmux
 copy-mode) and read the inked history.
 """
-import os, select, signal, subprocess, sys, time
+import asyncio, os, subprocess, time
 from rich.style import Style
 from rich.text import Text
 from teleprint.compositor import Compositor
@@ -46,13 +46,14 @@ EXCHANGES = [
 ]
 NOTE = 'click/alt-digit toggles · n adds · r runs · m modal · c menu · x closes · q quits'
 
-def main():
+async def amain():
     tty = RealTty()
     tty.write('\x1b[?1000;1006h')                 # SGR mouse on; teleprint parses the events
-    comp = Compositor(tty).start()
+    comp = await Compositor(tty).start()          # start owns the signals: WINCH -> on_resize, ctrl-C -> a key
     comp.numbering = True
     feed = iter(EXCHANGES)
-    state = dict(mode='code', menu=False, modal=False, run=None, alive=True)
+    state = dict(mode='code', menu=False, modal=False, run=None)
+    done = asyncio.Event()
 
     def add():
         for kind, text in next(feed, []):
@@ -76,9 +77,10 @@ def main():
         comp.set_tail(status, prompt, cursor=(1, 4), over=transients())
 
     def on_key(k):
-        if k.name == 'q':
-            state.update(menu=False, modal=False, run=None, alive=False)
+        if k.name in ('q', 'ctrl+c'):
+            state.update(menu=False, modal=False, run=None)
             paint()                               # one clean final frame: transients never ink as exit debris
+            done.set()
         elif k.name == 'n' and not state['modal']: add(); paint()
         elif k.name == 'r' and state['run'] is None:
             comp.print_block('slow_work()', gutter=GUT['inp'], tag='inp')
@@ -94,29 +96,31 @@ def main():
     comp.on_key = on_key
     comp.on_act = lambda token: (state.update(mode='prompt' if state['mode'] == 'code' else 'code'), paint())
     comp.on_wheel = lambda d: subprocess.run(['tmux', 'copy-mode', '-eu']) if d < 0 and os.environ.get('TMUX') else None
-    signal.signal(signal.SIGWINCH, lambda *a: state.update(resized=True))
+    comp.on_resize = lambda: (comp.resize(), paint())
 
+    loop = asyncio.get_running_loop()
+    loop.add_reader(tty.fd, lambda: comp.on_bytes(os.read(tty.fd, 1024)))
     for _ in range(5): add()
     paint()
-    while state['alive']:
-        r, _, _ = select.select([tty.fd], [], [], 0.1 if state['run'] else 0.25)
-        if r: comp.on_bytes(os.read(tty.fd, 1024))
-        else: comp.flush_input()
-        if state.pop('resized', None):
-            comp.resize()
-            paint()
-        if state['run']:
-            t, i = state['run']
-            if time.monotonic() - t > 3:
-                state['run'] = None
-                comp.print_block(f'slow_work finished in {time.monotonic() - t:.1f}s', gutter=GUT['out'], tag='out')
-            else: state['run'] = (t, i + 1)
-            paint()
-    tty.write('\x1b[?1000;1006l\r\n')
-    tty.restore()
+    try:
+        while not done.is_set():
+            try: await asyncio.wait_for(done.wait(), 0.1 if state['run'] else 0.25)
+            except asyncio.TimeoutError: comp.flush_input()
+            if state['run']:
+                t, i = state['run']
+                if time.monotonic() - t > 3:
+                    state['run'] = None
+                    comp.print_block(f'slow_work finished in {time.monotonic() - t:.1f}s', gutter=GUT['out'], tag='out')
+                else: state['run'] = (t, i + 1)
+                paint()
+    finally:
+        loop.remove_reader(tty.fd)
+        comp.stop()
+        tty.write('\x1b[?1000;1006l\r\n')
+        tty.restore()
 
 if __name__ == '__main__':
-    try: main()
+    try: asyncio.run(amain())
     except Exception:
         import traceback
         traceback.print_exc()  # after restore, so it is readable
