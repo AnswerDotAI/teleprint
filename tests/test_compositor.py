@@ -290,7 +290,7 @@ async def test_python_repl_with_gateway():
         comp.on_key = on_key
         paint()
         async def run_submitted():
-            async for o in kc.run(pending.pop()):
+            for o in await kc.exec_outs(pending.pop()):
                 txt = o.get('text', '')
                 txt = ''.join(txt) if isinstance(txt, list) else txt
                 if o['output_type'] == 'stream':

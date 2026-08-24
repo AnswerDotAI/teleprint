@@ -15,6 +15,8 @@ from teleprint.buffer import Buffer
 from teleprint.compositor import Compositor
 from teleprint.tty import RealTty
 from jupyasyncclient import JupyAsyncKernelClient
+from fastcore.nbio import msg2out
+from jupywire.route import OUTPUT_MSGS
 
 GATEWAY = os.environ.get('IPYAI_GATEWAY', 'http://127.0.0.1:8787')
 HINT = 'python -- Enter runs; Tab completes; ctrl-C interrupts; ctrl-D quits'
@@ -57,7 +59,9 @@ async def repl(t, kc):
 
     async def run_cell(code):
         try:
-            async for o in kc.run(code): on_out(o)
+            def _o(m):
+                if m['msg_type'] in OUTPUT_MSGS: on_out(msg2out(m))
+            await kc.run(code, on_output=_o)
         finally:
             state['run'] = None
             paint()
