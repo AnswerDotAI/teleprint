@@ -59,9 +59,8 @@ async def repl(t, kc):
 
     async def run_cell(code):
         try:
-            def _o(m):
+            async for m in kc.run(code):
                 if m['msg_type'] in OUTPUT_MSGS: on_out(msg2out(m))
-            await kc.run(code, on_output=_o)
         finally:
             state['run'] = None
             paint()
