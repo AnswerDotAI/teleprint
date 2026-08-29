@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.2
+
+### New Features
+
+- Update the pyrepl example for jupywire's streaming run() ([#4](https://github.com/AnswerDotAI/teleprint/pull/4)), thanks to [@jph00](https://github.com/jph00)
+
+
 ## 0.1.1
 
 ### New Features
