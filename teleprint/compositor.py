@@ -57,8 +57,8 @@ class Compositor:
 
     def _console(self, width):
         if width not in self._consoles:
-            self._consoles[width] = Console(width=width, force_terminal=True, color_system='truecolor',
-                                            markup=False, highlight=False)
+            self._consoles[width] = Console(width=width, height=self.rows, force_terminal=True,
+                color_system='truecolor', markup=False, highlight=False)
         return self._consoles[width]
 
     def _invalidate(self): self._painted = [None] * self.rows
@@ -162,13 +162,11 @@ class Compositor:
     # -- rendering ------------------------------------------------------------
     def _render(self, renderable): return self.console.render_lines(renderable, pad=False)
 
-    def _ansi(self, segs):
-        return ''.join(s.style.render(s.text) if s.style else s.text for s in segs)
+    def _ansi(self, segs): return ''.join(s.style.render(s.text) if s.style else s.text for s in segs)
 
     def _gutter_width(self, blk):
         f, c = blk.gutter
-        return max(cell_len(f.plain if isinstance(f, Text) else str(f)),
-                   cell_len(c.plain if isinstance(c, Text) else str(c)))
+        return max(cell_len(f.plain if isinstance(f, Text) else str(f)), cell_len(c.plain if isinstance(c, Text) else str(c)))
 
     def _content_lines(self, blk):
         """Rendered segment-lines of the whole body (all parts concatenated), caching the first line.
@@ -188,8 +186,7 @@ class Compositor:
         if live: gt.stylize(Style(meta={'toggle': bid}))
         return self._render(gt)[0]
 
-    def _summary_suffix(self, hidden):
-        return self._render(Text(f' … (+{hidden} lines)', style='dim'))[0]
+    def _summary_suffix(self, hidden): return self._render(Text(f' … (+{hidden} lines)', style='dim'))[0]
 
     def _fit(self, line):
         "Crop a composed line to the terminal width: one document row must be one screen row, never a wrap."
@@ -214,8 +211,7 @@ class Compositor:
 
     def _block_rows(self, blk):
         "Presentation rows from the per-block cache, rebuilt when stale (model changed or width changed)."
-        if getattr(blk, '_rows', None) is None or blk._rw != self.cols:
-            blk._rows, blk._rw = self._block_lines(blk), self.cols
+        if getattr(blk, '_rows', None) is None or blk._rw != self.cols: blk._rows, blk._rw = self._block_lines(blk), self.cols
         return blk._rows
 
     def _dirty(self, blk): blk._rows = None
@@ -283,10 +279,10 @@ class Compositor:
         d = ws - self._ws
         while d > 0:  # rows _ws..ws cross the edge: paint in current state, push with real LFs, chunked
             k = min(d, h)
-            for i in range(k):
-                out.append(f'\x1b[{i + 1};1H\x1b[K' + self._ansi(rows[self._ws + i][1]))
+            for i in range(k): out.append(f'\x1b[{i + 1};1H\x1b[K' + self._ansi(rows[self._ws + i][1]))
             out.append(f'\x1b[{h};1H' + '\n' * k)
-            self._ws += k; d -= k
+            self._ws += k
+            d -= k
             self._painted = [None] * h
         self._ws = ws  # shrink slides the window back: policy 2
         v = len(rows) - ws
@@ -354,8 +350,7 @@ class Compositor:
             self._dirty(blk)
         elif blk.collapsed:
             rows = self._block_rows(blk)  # cache exists at current width: refresh the one summary row
-            line = (self._gutter_segs(blk.gutter[0], True, blk.id) + list(blk._first)
-                    + self._summary_suffix(blk.height - 1))
+            line = (self._gutter_segs(blk.gutter[0], True, blk.id) + list(blk._first) + self._summary_suffix(blk.height - 1))
             rows[:] = [(blk.id, self._fit(line))]
         else:
             rows = self._block_rows(blk)
@@ -433,8 +428,7 @@ class Compositor:
         if y > self.rows - 1:  # content reaches the bottom row: open a fresh line (the scroll inks one row, as displayed)
             self.tty.write(f'\x1b[{self.rows};1H\r\n\x1b[J')
             y = self.rows - 1
-        else:
-            self.tty.write(f'\x1b[{y + 1};1H\x1b[J')
+        else: self.tty.write(f'\x1b[{y + 1};1H\x1b[J')
         for b in self.blocks.values(): b.committed = True
         self._epoch = []
         self._ws = 0

@@ -32,8 +32,7 @@ async def test_scroll_inks_each_row_once():
     bs = [comp.print_block(f'top {i}\nbot {i}', gutter=G) for i in range(5)]
     assert comp._ws == 5  # 10 content rows, 5 fit above the tail
     lines = tty.term.contents().splitlines()
-    for i in range(5):
-        assert lines.count(f'» top {i}') == 1 and lines.count(f'  bot {i}') == 1
+    for i in range(5): assert lines.count(f'» top {i}') == 1 and lines.count(f'  bot {i}') == 1
     assert not any(b.committed for b in bs)  # write-once: everything stays in the document
     assert parked(tty, comp)
 
@@ -168,11 +167,12 @@ async def test_resize_then_everything_still_works():
     tty, comp = await make(30, 8)
     comp.set_tail('> ')
     b1 = comp.print_block('stuff\nmore', gutter=G)
-    tty.term.resize(40, 8)
+    tty.term.resize(120, 8)
     comp.resize()
-    comp.set_tail('> ')  # the app repaints its tail after a resize (rendered tail rows are width-stale)
+    status = 's' * 100
+    comp.set_tail(status, '> ')  # the app repaints its tail after a resize (rendered tail rows are width-stale)
     comp.print_block('after', gutter=G)
-    assert 'after' in tty.term.text()
+    assert status in tty.term.text() and 'after' in tty.term.text()  # rendering follows the owned tty, not the host process's width
     comp.toggle(b1)
     assert b1.collapsed and '» stuff … (+1 lines)' in tty.term.text()
     assert parked(tty, comp)
@@ -355,8 +355,7 @@ async def test_collapsed_summary_cropped():
     comp.extend(b, 'z' * 28)
     comp.extend(b, 'w' * 28)
     assert b.collapsed
-    for bid, segs in comp._doc_rows():
-        assert sum(cell_len(s.text) for s in segs) <= 30
+    for bid, segs in comp._doc_rows(): assert sum(cell_len(s.text) for s in segs) <= 30
     assert tty.term.text().splitlines()[-1] == 'tail'
 
 async def test_record_block_paints_nothing():
