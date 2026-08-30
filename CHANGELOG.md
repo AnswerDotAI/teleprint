@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.3
+
+### Bugs Squashed
+
+- Respect owned terminal widths under Rich 15 ([#5](https://github.com/AnswerDotAI/teleprint/pull/5)), thanks to [@jph00](https://github.com/jph00)
+
+
 ## 0.1.2
 
 ### New Features
