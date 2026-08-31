@@ -4,38 +4,18 @@ Design rationale and working notes for teleprint and the ipyai rewrite that driv
 
 ## The design principle
 
-Work *with* the terminal's natural behavior, never against it. This is the #1 goal and the
-tiebreaker for every design decision: when a feature needs the terminal to be something it
-isn't, the feature changes shape, not the terminal. In practice:
+Work *with* the terminal's natural behavior, never against it. This is the #1 goal and the tiebreaker for every design decision: when a feature needs the terminal to be something it isn't, the feature changes shape, not the terminal. In practice:
 
-- History IS the terminal's scrollback. We never track, address, or repaint anything that has
-  scrolled away: content crosses the top edge via real LF scrolls, once, and tmux/terminal
-  search, selection, and copy work on it natively forever.
-- Launch like any CLI program: adopt the shell's cursor row (the one CPR) and start printing
-  there. The shell's screen stays put and scrolls off only as content needs the space. No
-  clear-screen takeover; quitting leaves the transcript in scrollback.
-- Resize is a repaint, not an investigation. We never ask the terminal where our rows went; we
-  redraw the visible region from the model, and the terminal's own rewrap of inked history is
-  its business.
-- Scrolling is handed back: wheel-up in tmux enters tmux copy-mode (`-e` returns at bottom).
-  We don't reimplement what the terminal does better.
-- Jobs get the real pty (process group, raw mode, signals through the line discipline); their
-  output is digested by a terminal emulator, not by regexes — and vim's alt screen erases
-  itself from the record by its own semantics, for free.
-- The alt screen is used for exactly what it exists for: a deliberately-entered, self-restoring
-  modal surface (the transcript view) — never to own the main history.
+- History IS the terminal's scrollback. We never track, address, or repaint anything that has scrolled away: content crosses the top edge via real LF scrolls, once, and tmux/terminal search, selection, and copy work on it natively forever.
+- Launch like any CLI program: adopt the shell's cursor row (the one CPR) and start printing there. The shell's screen stays put and scrolls off only as content needs the space. No clear-screen takeover; quitting leaves the transcript in scrollback.
+- Resize is a repaint, not an investigation. We never ask the terminal where our rows went; we redraw the visible region from the model, and the terminal's own rewrap of inked history is its business.
+- Scrolling is handed back: wheel-up in tmux enters tmux copy-mode (`-e` returns at bottom). We don't reimplement what the terminal does better.
+- Jobs get the real pty (process group, raw mode, signals through the line discipline); their output is digested by a terminal emulator, not by regexes — and vim's alt screen erases itself from the record by its own semantics, for free.
+- The alt screen is used for exactly what it exists for: a deliberately-entered, self-restoring modal surface (the transcript view) — never to own the main history.
 
-The same principle governs optional capabilities: one is a safe enhancement when its fallback
-is *absence* (image doesn't show, colors are duller, repaint flickers); it is a trap when its
-fallback is *a different interaction design* (then everything ships twice). Scheme-based OSC 8
-click handlers (custom URI scheme → kitty open_actions / OS scheme handler → helper → control
-socket) were designed in full and rejected on this rule: Terminal.app and PuTTY lack OSC 8, so
-it can never be the one scheme. OSC 8 survives cosmetically only (file paths as links; harmless
-where unsupported), never load-bearing.
+The same principle governs optional capabilities: one is a safe enhancement when its fallback is *absence* (image doesn't show, colors are duller, repaint flickers); it is a trap when its fallback is *a different interaction design* (then everything ships twice). Scheme-based OSC 8 click handlers (custom URI scheme → kitty open_actions / OS scheme handler → helper → control socket) were designed in full and rejected on this rule: Terminal.app and PuTTY lack OSC 8, so it can never be the one scheme. OSC 8 survives cosmetically only (file paths as links; harmless where unsupported), never load-bearing.
 
-The compositor's write-once rewrite is this principle applied in the negative: the one place we
-fought the terminal (bookkeeping rows it owned) generated the whole resize/CPR bug class, and
-deleting the fight deleted the bugs.
+The compositor's write-once rewrite is this principle applied in the negative: the one place we fought the terminal (bookkeeping rows it owned) generated the whole resize/CPR bug class, and deleting the fight deleted the bugs.
 
 ## Write-once history
 
@@ -49,22 +29,7 @@ One scheme, stated once: **keyboard is the complete interface; SGR mouse is an a
 - Clicks: SGR mouse (1000+1006), supported by every target terminal. A click resolves through the per-frame row→target map; valid by construction, since clicks only reach the app when the viewport is at the live position (scrolled up, tmux/the terminal owns the mouse).
 - Wheel: inside tmux, delegate — on wheel-up run `tmux copy-mode -eu` on our own pane, handing the gesture back to tmux (this reproduces the branch tmux's own default wheel binding takes for non-mouse apps; `-e` exits copy-mode at bottom, resuming clicks). Outside tmux there is no portable "enter scrollback programmatically", so wheel opens the transcript view; shift+wheel reaches native scrollback in most terminals.
 
-Ambient numbering (settled 2026-07-24; supersedes the "picker mode" design): the newest ≤10
-*toggleable* visible blocks (height > 1) wear a digit, 0 = newest, read off the block and
-pressed as alt-digit to toggle the wearer — no mode, no overlay, one keystroke. Numbers are
-assigned newest-first among blocks with rows in the window, so renumbering happens only on
-append (≤10 first-row repaints through the frame diff); a straddler whose first row has inked
-shows no digit (still click-toggleable). Inking needs no special case and rule 2 stays pure:
-numbering is a property of the *window*, so a row leaving the window de-numbers in the same
-frame, and digits never reach history at all — no strip code, clean gutters in scrollback
-(built and discovered mechanically; supersedes the "digits ink as displayed" ruling, whose
-point was refusing a strip mechanism — none exists). To keep gutter
-width constant under renumber churn (content renders at cols - gutter_width), all gutters are
-3 chars + space, shaped `x\dx`: the type glyph flanks a middle cell that rests as the glyph
-(`»»»`) and carries the digit when numbered (`»4»`). Glyph per type (strictly 1-cell,
-unambiguous width): code in `»»»` bold, prompt in `›››` bold, tool use `≡≡≡` dim, code result
-`«««`, prompt response `‹‹‹`, continuation `···` dim (never numbered), errors are the result
-glyph in red. Exact glyphs to be eyeballed live before freezing.
+Ambient numbering (settled 2026-07-24; supersedes the "picker mode" design): the newest ≤10 *toggleable* visible blocks (height > 1) wear a digit, 0 = newest, read off the block and pressed as alt-digit to toggle the wearer — no mode, no overlay, one keystroke. Numbers are assigned newest-first among blocks with rows in the window, so renumbering happens only on append (≤10 first-row repaints through the frame diff); a straddler whose first row has inked shows no digit (still click-toggleable). Inking needs no special case and rule 2 stays pure: numbering is a property of the *window*, so a row leaving the window de-numbers in the same frame, and digits never reach history at all — no strip code, clean gutters in scrollback (built and discovered mechanically; supersedes the "digits ink as displayed" ruling, whose point was refusing a strip mechanism — none exists). To keep gutter width constant under renumber churn (content renders at cols - gutter_width), all gutters are 3 chars + space, shaped `x\dx`: the type glyph flanks a middle cell that rests as the glyph (`»»»`) and carries the digit when numbered (`»4»`). Glyph per type (strictly 1-cell, unambiguous width): code in `»»»` bold, prompt in `›››` bold, tool use `≡≡≡` dim, code result `«««`, prompt response `‹‹‹`, continuation `···` dim (never numbered), errors are the result glyph in red. Exact glyphs to be eyeballed live before freezing.
 
 
 Click hit-testing rides Rich's own machinery (the mechanism Textual uses): `Style.meta` carries arbitrary data on rendered Segments and is never emitted in ANSI. The block *chrome* (gutter marker, disclosure header — composed by the compositor around the content) gets `Style(meta={'toggle': block_id})`; content renderers never know about clicking. The compositor holds the frame it just painted (it rendered those rows anyway); a click maps row → target via the per-frame map, then col → segment by accumulating `cell_len`, then reads meta and dispatches the same action the keyboard would. Zone rules fall out: only the current frame hit-tests, and inked history carries nothing to strip since meta never reached the terminal. Hit-testing and emission share one width accounting, so only terminal-vs-Rich width disagreement (emoji, ambiguous-width) can drift a click by a cell — mitigated by making targets line-granular (whole header line toggles: robust and a bigger target). Tail and transient rows carry actions the same way: `Style(meta={'act': token})` dispatches to the `on_act` hook (the status-line mode button, picker rows). Segment-granular targets are reserved for rare multi-action lines; in-prose links use cosmetic OSC 8. The transcript view reuses all of this against its own viewport map.
@@ -73,18 +38,7 @@ Click hit-testing rides Rich's own machinery (the mechanism Textual uses): `Styl
 
 An alt-screen, deliberately-entered live projection of the block model — enter (ctrl-T), browse, leave; main screen untouched. The organizing principle: the main screen has no selection concept; the transcript view is where a **block cursor** exists, so its uses are exactly the operations that address a block as an object. Built: navigation and toggle-in-place (committed history becomes toggleable here, lifting the main screen's inert-history limitation where it matters), smart-case regex search over the MODEL (so it matches inside collapsed content; landing on a match expands it, vim's fold-open rule), model-granularity copy (`y` via OSC 52: the block's stored `source` — no box-drawing, no wrap artifacts), and the shared composer (type or paste while browsing; Enter with content submits and leaves; two focus states, `i` entering compose explicitly since single-key ops and typing collide on the op characters). Being built now: `e` edit, shift-arrow exchange jump, follow mode (`less +F` style: pinned to the tail while a turn streams; navigation unpins, `G` re-pins). Considered and dropped (2026-07-24, re-proposable from need): filtered projections, session archaeology, export-a-block-range.
 
-**Hide and pin (built; the first dialog-editing operation).** `skipped` and `pinned` are base-`Message`
-fields in aidialog (solveit's literal metadata keys, so files mean the same thing in every host):
-`skipped` hides a message from the AI -- `dlg2hist` drops it from every projection -- and `pinned` marks
-it for whatever context policy a host runs (solveit's `limit_msgs` eviction keeps pinned; ipyai
-will compact rather than evict -- deferred, llmsurgery-based). In ipyai, `h` on the transcript-view cursor block flips `skipped` for the block's whole
-exchange -- one exchange (input + outputs, or ask + reply + tool calls) is ONE dialog message, so both
-halves go together by construction. Every block printed for an exchange is stamped with its message id
-at record time (`_stamp_exchange`); hidden exchanges render dim on both surfaces (`Block.dim`, a
-self-invalidating property). Persistence: `%ipyai save`/`load` ride the meta_attrs round-trip for
-free, and a toggle just saves the session dialog whole, like every other event. The ctx meter
-reflects a hide only after the next turn: it
-reports the API's measured usage, not an estimate.
+**Hide and pin (built; the first dialog-editing operation).** `skipped` and `pinned` are base-`Message` fields in aidialog (solveit's literal metadata keys, so files mean the same thing in every host): `skipped` hides a message from the AI -- `dlg2hist` drops it from every projection -- and `pinned` marks it for whatever context policy a host runs (solveit's `limit_msgs` eviction keeps pinned; ipyai will compact rather than evict -- deferred, llmsurgery-based). In ipyai, `h` on the transcript-view cursor block flips `skipped` for the block's whole exchange -- one exchange (input + outputs, or ask + reply + tool calls) is ONE dialog message, so both halves go together by construction. Every block printed for an exchange is stamped with its message id at record time (`_stamp_exchange`); hidden exchanges render dim on both surfaces (`Block.dim`, a self-invalidating property). Persistence: `%ipyai save`/`load` ride the meta_attrs round-trip for free, and a toggle just saves the session dialog whole, like every other event. The ctx meter reflects a hide only after the next turn: it reports the API's measured usage, not an estimate.
 
 Copy-mode and the transcript view divide labor: **copy-mode = the archive** (complete, searchable, inert), **transcript view = the live view** (compact, clickable, in-place). Same document, two projections.
 
@@ -130,15 +84,7 @@ Paint state is two integers — `top` (screen row of the region origin, worn dow
 
 Deleted with the old interior, and with them their whole bug class and test family: the block→line map over history, bottom-anchored `_park` arithmetic, commit/demotion bookkeeping, the archival restyle (and the bright/dim clickable-vs-history affordance — everything visible is clickable now, and history is above the edge), the async resize CPR resync (`on_resync`, `flush_input` expiry, provisional anchors), and line-granular tail diff-repaint as a special case (the frame engine repaints the window; row-level diffing is an optimization to add only if ever needed).
 
-The one bug class transients ever produced is closed by a rule worth keeping: **a frame is just
-rows -- the engine sizes the region to the whole frame** (window + over rows + tail), scrolling
-for room like any growth (shell rows are already final, so nothing pre-paints) and never letting
-over rows or the tail clip (a pathological transient taller than the screen clips itself; the
-tail survives). The bug it killed: at launch the region is a few rows at the bottom of a full
-screen, and a session picker taller than region+free rows painted its overflow off-frame --
-looking exactly like a hang (loop idle in select(), keys answered blind). Transients were a
-second row species with their own space arithmetic; now they participate in the one sizing
-computation, and the class is gone (test_transients_grow_a_young_region pins it).
+The one bug class transients ever produced is closed by a rule worth keeping: **a frame is just rows -- the engine sizes the region to the whole frame** (window + over rows + tail), scrolling for room like any growth (shell rows are already final, so nothing pre-paints) and never letting over rows or the tail clip (a pathological transient taller than the screen clips itself; the tail survives). The bug it killed: at launch the region is a few rows at the bottom of a full screen, and a session picker taller than region+free rows painted its overflow off-frame -- looking exactly like a hang (loop idle in select(), keys answered blind). Transients were a second row species with their own space arithmetic; now they participate in the one sizing computation, and the class is gone (test_transients_grow_a_young_region pins it).
 
 ## Packaging
 
@@ -164,18 +110,9 @@ The binding constraint on model-assisted development here is that the agent must
 
 What neither tier covers — actual rendering in Terminal.app/kitty/ghostty (fonts, real wheel feel, image pixels) — stays a human smoke-test, rare by design.
 
-Two suite lessons that keep paying: run pytest per-repo (combining two repos' test dirs moves
-rootdir above the ini, silently disabling asyncio mode); and width-invariant assertions (every
-painted row <= cols) catch the wrap-corruption class that screen-text assertions miss -- a real
-terminal's autowrap shears the frame when a full-width-highlighted row plus gutter passes
-`cols`, while the same corruption is invisible on a mostly-empty emulator screen.
+Two suite lessons that keep paying: run pytest per-repo (combining two repos' test dirs moves rootdir above the ini, silently disabling asyncio mode); and width-invariant assertions (every painted row <= cols) catch the wrap-corruption class that screen-text assertions miss -- a real terminal's autowrap shears the frame when a full-width-highlighted row plus gutter passes `cols`, while the same corruption is invisible on a mostly-empty emulator screen.
 
-Wedge diagnosis, no sudo needed: ipyai registers `faulthandler.register(SIGQUIT)` at startup, so
-`C-\` into a stuck-looking app prints every thread's Python stack to the pane and continues --
-capturable over tmux (`send_keys('%N', 'C-\\')` + `screen()`). For a process too far gone for
-signal handlers, macOS `sample <pid>` gives native stacks unprivileged (enough to tell spinning
-from parked); py-spy would give Python stacks uncooperatively but needs sudo on macOS, so it is
-the last resort.
+Wedge diagnosis, no sudo needed: ipyai registers `faulthandler.register(SIGQUIT)` at startup, so `C-\` into a stuck-looking app prints every thread's Python stack to the pane and continues -- capturable over tmux (`send_keys('%N', 'C-\\')` + `screen()`). For a process too far gone for signal handlers, macOS `sample <pid>` gives native stacks unprivileged (enough to tell spinning from parked); py-spy would give Python stacks uncooperatively but needs sudo on macOS, so it is the last resort.
 
 ## Transcript persistence
 
@@ -183,174 +120,44 @@ The session IS its file: one dialog `.ipynb` per session under `./.ipyai/session
 
 ## ipyai assistant wiring
 
-The session IS a Dialog (aidialog): `add_cell` appends code/note messages (bare-string cells
-become markdown notes; outputs are verbatim nbformat), `run_prompt` appends a prompt message and
-sets its output to the reply. Ctx = `dlg2hist`; `$`var``/`!`cmd`` refs both evaluate in the
-kernel at turn time (! via the kernel's own `getoutput`: stdout+stderr, kernel cwd, `var_expand`
-interpolation) and merge into one synthetic variables turn at the
-top of history (aidialog's `vars_hist`). On backend failure the pending prompt message is removed
-so a retry cannot double it (regression-tested).
+The session IS a Dialog (aidialog): `add_cell` appends code/note messages (bare-string cells become markdown notes; outputs are verbatim nbformat), `run_prompt` appends a prompt message and sets its output to the reply. Ctx = `dlg2hist`; `$`var``/`!`cmd`` refs both evaluate in the kernel at turn time (! via the kernel's own `getoutput`: stdout+stderr, kernel cwd, `var_expand` interpolation) and merge into one synthetic variables turn at the top of history (aidialog's `vars_hist`). On backend failure the pending prompt message is removed so a retry cannot double it (regression-tested).
 
-One stream, two consumers: the AsyncChat stream tees into fastllm's AsyncStreamFormatter
-(`fmt.outp` is the canonical stored/replayed form; `fmt2hist` round-trips it) and TurnRenderer
-(blocks). The interrupt marker is solveit's `*[Response interrupted]*` (ai_fmt strips it on
-replay). The ctx meter reads AsyncChat.last_req_use, not chat.use: per-request usage is the ctx
-size, while chat.use sums a whole turn's tool-call steps and would overcount. Resume renders
-stored replies via fmt2hist: text parts feed the md flow, tool parts replay as real collapsed
-tool blocks.
+One stream, two consumers: the AsyncChat stream tees into fastllm's AsyncStreamFormatter (`fmt.outp` is the canonical stored/replayed form; `fmt2hist` round-trips it) and TurnRenderer (blocks). The interrupt marker is solveit's `*[Response interrupted]*` (ai_fmt strips it on replay). The ctx meter reads AsyncChat.last_req_use, not chat.use: per-request usage is the ctx size, while chat.use sums a whole turn's tool-call steps and would overcount. Resume renders stored replies via fmt2hist: text parts feed the md flow, tool parts replay as real collapsed tool blocks.
 
-ctrl-C during a turn cancels a dedicated stream-consumer TASK, not the run_prompt coroutine --
-cancelling the caller would disrupt its own cleanup awaits (aclose, the kernel writeback).
-`Assistant.cancel_turn` is the one entry; the partial is frozen via `TurnRenderer.stopped()` and
-the turn records with `<system>user interrupted</system>`.
+ctrl-C during a turn cancels a dedicated stream-consumer TASK, not the run_prompt coroutine -- cancelling the caller would disrupt its own cleanup awaits (aclose, the kernel writeback). `Assistant.cancel_turn` is the one entry; the partial is frozen via `TurnRenderer.stopped()` and the turn records with `<system>user interrupted</system>`.
 
-The kernel tool is named `py`, not `python`: codex rejects thread creation when a dynamic tool
-takes a name "reserved for use by this model", and `python` is one. CUSTOM_TOOL_NAMES lists both
-(safepyrun's extension seeds the legacy name for old kernels); only one is ever defined.
+The kernel tool is named `py`, not `python`: codex rejects thread creation when a dynamic tool takes a name "reserved for use by this model", and `python` is one. CUSTOM_TOOL_NAMES lists both (safepyrun's extension seeds the legacy name for old kernels); only one is ever defined.
 
 ## Modes and routing
 
-Three modes, one per interpreter the app fronts: **prompt** (the AI), **code** (the kernel),
-**shell** (the persistent shell). `M-p`/`M-c`/`M-s` select a mode directly (normal usage);
-clicking the status-bar mode segment cycles through the three; the composer mark shows the mode
-(`››› ` / `»»» ` / `$$$ `), and an empty composer hints the two OTHER modes' M- keys (the
-current mode is already on the status line; the hint answers "how do I get out"). Prefix
-overrides work identically from every mode, one submission at
-a time: `.` sends a prompt, `;` runs code, a leading `!` runs shell. A submission *starting*
-with `!` goes to the shell whole (multiline is fine: it is one shell script); *embedded* `!`
-(`x = !ls`) is ordinary code, keeping IPython's exact SList capture semantics kernel-side.
-Records canonicalize independent of mode: shell submissions store as `!cmd` cells, prompts as
-prompt messages -- so load, resume, ctx, and export never need to know the screen's mode.
+Three modes, one per interpreter the app fronts: **prompt** (the AI), **code** (the kernel), **shell** (the persistent shell). `M-p`/`M-c`/`M-s` select a mode directly (normal usage); clicking the status-bar mode segment cycles through the three; the composer mark shows the mode (`››› ` / `»»» ` / `$$$ `), and an empty composer hints the two OTHER modes' M- keys (the current mode is already on the status line; the hint answers "how do I get out"). Prefix overrides work identically from every mode, one submission at a time: `.` sends a prompt, `;` runs code, a leading `!` runs shell. A submission *starting* with `!` goes to the shell whole (multiline is fine: it is one shell script); *embedded* `!` (`x = !ls`) is ordinary code, keeping IPython's exact SList capture semantics kernel-side. Records canonicalize independent of mode: shell submissions store as `!cmd` cells, prompts as prompt messages -- so load, resume, ctx, and export never need to know the screen's mode.
 
-The dispatch rule this settles: kernel-adjacent state rides the comm magic (`%ipyai`);
-terminal/UI state gets keys and transients; shell state belongs to the shell itself. No fake
-magics: `%fg`/`%jobs` died when job control moved into the persistent shell (below).
+The dispatch rule this settles: kernel-adjacent state rides the comm magic (`%ipyai`); terminal/UI state gets keys and transients; shell state belongs to the shell itself. No fake magics: `%fg`/`%jobs` died when job control moved into the persistent shell (below).
 
 ## Shell layer
 
-**One persistent shell** (settled 2026-07-24; replaces the per-command jobs machinery). The
-first shell submission lazily spawns the user's shell, interactive with job control, as session
-leader of its own pty -- so `cd`, exports, venv activation, aliases, functions, and the jobs
-table all persist across commands, and `fg`/`bg`/`jobs`/ctrl-Z are the shell's own builtins
-(we rebuild none of it: work *with* the shell too). Injected prompt integration (bash:
-`--rcfile` sourcing the user's rc first, then PROMPT_COMMAND + a guarded DEBUG trap for echo;
-zsh: a `ZDOTDIR` shim sourcing the user's rc then owning `precmd`/`preexec` and clearing prompt
-frameworks' hook arrays; other shells run as bash, fish parked) emits a private OSC carrying
-`$?` and `$PWD` at each prompt: that marker is the
-**command boundary** -- stripped by the relay, so it never reaches the terminal: NO terminal or tmux support is required (and an unknown private OSC would be ignored anyway). `$PWD` back-syncs to
-the kernel after each command, so the two worlds agree about where you are (an OSC 133 upgrade
-is a parked option: same mechanism, plus prompt-jump in integrated terminals).
+**One persistent shell** (settled 2026-07-24; replaces the per-command jobs machinery). The first shell submission lazily spawns the user's shell, interactive with job control, as session leader of its own pty -- so `cd`, exports, venv activation, aliases, functions, and the jobs table all persist across commands, and `fg`/`bg`/`jobs`/ctrl-Z are the shell's own builtins (we rebuild none of it: work *with* the shell too). Injected prompt integration (bash: `--rcfile` sourcing the user's rc first, then PROMPT_COMMAND + a guarded DEBUG trap for echo; zsh: a `ZDOTDIR` shim sourcing the user's rc then owning `precmd`/`preexec` and clearing prompt frameworks' hook arrays; other shells run as bash, fish parked) emits a private OSC carrying `$?` and `$PWD` at each prompt: that marker is the **command boundary** -- stripped by the relay, so it never reaches the terminal: NO terminal or tmux support is required (and an unknown private OSC would be ignored anyway). `$PWD` back-syncs to the kernel after each command, so the two worlds agree about where you are (an OSC 133 upgrade is a parked option: same mechanism, plus prompt-jump in integrated terminals).
 
-Per-command flow: borrow (release -> raw), write the submission to the shell's pty, relay/tee
-into a fresh per-command mirror, boundary marker ends the borrow (reanchor), and the mirror's
-emulator-cleaned residue records as a `!cmd` cell with the exit code -- the same
-record_block/add_cell shape as before (the mirror IS the cleaner: alt-screen apps erase
-themselves from `contents()` by their own semantics -- vim's rule for free). ctrl-Z needs no
-special handling: the shell stops the child and prints its prompt, which IS the boundary.
-F2 rides the same borrow with `record=False`: composer text to a temp file, `$EDITOR` runs it
-(resolved from the app's own env -- the pty shell's rc overrides env vars, see edit_buffer),
-clean exit reloads the composer, nonzero (vim's `:cq`) abandons; nothing records.
-Between borrows a background drain pumps the channel into a rolling mirror (bg job output, `[1]
-Done` notices); at the next borrow anything drained prints first as a small block. `exit` kills
-the shell: it respawns fresh on next use, with a note. Quit gate: C-D while a shell exists warns
-once (the shell and any jobs in it close with the app); an immediate second C-D quits, and the
-app's teardown deletes the owned terminal, taking its jobs with it -- exactly a terminal window
-close. (The old `pgrep -P` children listing died with the local pty: the shell's process now
-lives in the gateway, so there is no local child list to show.)
+Per-command flow: borrow (release -> raw), write the submission to the shell's pty, relay/tee into a fresh per-command mirror, boundary marker ends the borrow (reanchor), and the mirror's emulator-cleaned residue records as a `!cmd` cell with the exit code -- the same record_block/add_cell shape as before (the mirror IS the cleaner: alt-screen apps erase themselves from `contents()` by their own semantics -- vim's rule for free). ctrl-Z needs no special handling: the shell stops the child and prints its prompt, which IS the boundary. F2 rides the same borrow with `record=False`: composer text to a temp file, `$EDITOR` runs it (resolved from the app's own env -- the pty shell's rc overrides env vars, see edit_buffer), clean exit reloads the composer, nonzero (vim's `:cq`) abandons; nothing records. Between borrows a background drain pumps the channel into a rolling mirror (bg job output, `[1] Done` notices); at the next borrow anything drained prints first as a small block. `exit` kills the shell: it respawns fresh on next use, with a note. Quit gate: C-D while a shell exists warns once (the shell and any jobs in it close with the app); an immediate second C-D quits, and the app's teardown deletes the owned terminal, taking its jobs with it -- exactly a terminal window close. (The old `pgrep -P` children listing died with the local pty: the shell's process now lives in the gateway, so there is no local child list to show.)
 
-Teleprint side: `jobs.py` is gone (2026-08-04). The shell became a jupygate-hosted terminal
-(ptymini pty, ws attach), owned by ipyai and deleted on exit, so the machinery moved to
-`ipyai/shell.py`: `GateShell` carries the same rc/sentinel choreography (it is all in-band, so
-it survived the transport change verbatim) and `relay` keeps `relay_shell`'s exact contract.
-Teleprint keeps only what is genuinely terminal-UI: the borrow choreography
-(`release()`/`reanchor()`/`record_block()`, RealTty `raw()`/`cooked()`) is exactly as before.
-Known env facts, by design: the shell's environment is its own (spawned by the gateway, with the app's TERM/COLORTERM overlaid;
-cwd flows shell -> kernel via the boundary marker, kernel `%cd` does NOT flow back to the
-shell); kernel-side `!` (embedded forms) sees the kernel's environment.
+Teleprint side: `jobs.py` is gone (2026-08-04). The shell became a jupygate-hosted terminal (ptymini pty, ws attach), owned by ipyai and deleted on exit, so the machinery moved to `ipyai/shell.py`: `GateShell` carries the same rc/sentinel choreography (it is all in-band, so it survived the transport change verbatim) and `relay` keeps `relay_shell`'s exact contract. Teleprint keeps only what is genuinely terminal-UI: the borrow choreography (`release()`/`reanchor()`/`record_block()`, RealTty `raw()`/`cooked()`) is exactly as before. Known env facts, by design: the shell's environment is its own (spawned by the gateway, with the app's TERM/COLORTERM overlaid; cwd flows shell -> kernel via the boundary marker, kernel `%cd` does NOT flow back to the shell); kernel-side `!` (embedded forms) sees the kernel's environment.
 
 ## The %ipyai magic
 
-A NORMAL kernel-side async line magic (`ipyai/magic.py`) talking to the host app over Jupyter
-comms -- no socket, no app-side line interception (route() sends `%ipyai ...` to the kernel as
-code in all modes). Every command is request/reply: the magic opens a comm, calls
-`kernel.unlock()` (ipymini releases the shell queue so the host's comm_msg can be processed
-mid-cell) and awaits the host's ack with a ~5s timeout -- so "no ipyai host attached" and
-non-ipymini kernels fail loudly, and results return as ordinary cell output, flowing into ctx +
-persistence for free. Host side: KernelSession.run routes comm messages to `App._on_comm`, which
-dispatches `_ipyai_cmd` and acks by request id. Setters double as getters (`%ipyai model` with no
-value shows the current one); settings are session-only, config.json is never written. The
-kernel-bridge path is deliberately unwired: a `py`-tool-invoked `%ipyai` would need nested async
-run_cell inside the kernel's running loop, which IPython can't do; it fails via the magic's own
-timeout. Async line magics ride `fastcore.aio.enable_async_magics`, which ipymini enables in
-MiniShell. One live note: Enter is gated while a cell runs (by design), so scripted drivers must
-wait for the ack block before the next submit or input piles up in the composer.
+A NORMAL kernel-side async line magic (`ipyai/magic.py`) talking to the host app over Jupyter comms -- no socket, no app-side line interception (route() sends `%ipyai ...` to the kernel as code in all modes). Every command is request/reply: the magic opens a comm, calls `kernel.unlock()` (ipymini releases the shell queue so the host's comm_msg can be processed mid-cell) and awaits the host's ack with a ~5s timeout -- so "no ipyai host attached" and non-ipymini kernels fail loudly, and results return as ordinary cell output, flowing into ctx + persistence for free. Host side: KernelSession.run routes comm messages to `App._on_comm`, which dispatches `_ipyai_cmd` and acks by request id. Setters double as getters (`%ipyai model` with no value shows the current one); settings are session-only, config.json is never written. The kernel-bridge path is deliberately unwired: a `py`-tool-invoked `%ipyai` would need nested async run_cell inside the kernel's running loop, which IPython can't do; it fails via the magic's own timeout. Async line magics ride `fastcore.aio.enable_async_magics`, which ipymini enables in MiniShell. One live note: Enter is gated while a cell runs (by design), so scripted drivers must wait for the ack block before the next submit or input piles up in the composer.
 
 ## Parked / next
 
-**Dialog editing (the next big milestone).** Editing is model-first; the glass is a log. The
-durable main screen stays append-only (the thesis holds): edits never repaint history. All edits
--- cut/paste to move, edit a prompt's input or a reply's text, edit cell source, drop/pin for AI
-ctx -- apply to the session Dialog (+ store), where aidialog's cut_msgs/paste_msgs/move_msgs/msg
-editors already do the work. The transcript view re-renders from the model, so it is both the
-editor surface and where edits show; ctx assembly, resume, and export read the model, so edits
-flow everywhere downstream. Optional one-line note block on the main screen keeps the log honest.
-`e` (settled 2026-07-24, being built): the block cursor is finer than the model, so targets map
-honestly onto the ONE message an exchange is -- `e` on an input/shell block edits cell source, on
-an ask block edits the prompt's content, on any reply-side block edits the WHOLE reply markdown
-(tool calls and results live inside that blob; F2-under-the-view was considered and deferred -- a
-job borrow beneath the alt screen loses the view when $EDITOR exits its own alt screen). Editing
-state owns Enter (write back, stay in view) and Esc (cancel); no re-exec -- editing a tool result
-rewrites what the AI remembers observing, kernel state untouched. Write-back updates message +
-store row + block bodies (first block re-rendered, sibling reply blocks emptied -- scrollback
-keeps the old text, that is the log). Per-piece reply editing via reply2dlg/dlg2reply is the
-refinement if whole-reply grates. Structural ops work at MESSAGE granularity (cell+outputs,
-prompt+reply move together); collapse and `y` stay block-level. Hide (`h`, solveit's key) and the
-pin flag are BUILT (see Transcript mode); remaining approved-in-principle keys: `x` cut,
-`p` paste-after, `*` pin-toggle UI.
+**Dialog editing (the next big milestone).** Editing is model-first; the glass is a log. The durable main screen stays append-only (the thesis holds): edits never repaint history. All edits -- cut/paste to move, edit a prompt's input or a reply's text, edit cell source, drop/pin for AI ctx -- apply to the session Dialog (+ store), where aidialog's cut_msgs/paste_msgs/move_msgs/msg editors already do the work. The transcript view re-renders from the model, so it is both the editor surface and where edits show; ctx assembly, resume, and export read the model, so edits flow everywhere downstream. Optional one-line note block on the main screen keeps the log honest. `e` (settled 2026-07-24, being built): the block cursor is finer than the model, so targets map honestly onto the ONE message an exchange is -- `e` on an input/shell block edits cell source, on an ask block edits the prompt's content, on any reply-side block edits the WHOLE reply markdown (tool calls and results live inside that blob; F2-under-the-view was considered and deferred -- a job borrow beneath the alt screen loses the view when $EDITOR exits its own alt screen). Editing state owns Enter (write back, stay in view) and Esc (cancel); no re-exec -- editing a tool result rewrites what the AI remembers observing, kernel state untouched. Write-back updates message + store row + block bodies (first block re-rendered, sibling reply blocks emptied -- scrollback keeps the old text, that is the log). Per-piece reply editing via reply2dlg/dlg2reply is the refinement if whole-reply grates. Structural ops work at MESSAGE granularity (cell+outputs, prompt+reply move together); collapse and `y` stay block-level. Hide (`h`, solveit's key) and the pin flag are BUILT (see Transcript mode); remaining approved-in-principle keys: `x` cut, `p` paste-after, `*` pin-toggle UI.
 
-**Retry / edit-and-resubmit (settled with Jeremy 2026-07-24, BUILT).** A retry state -- (target
-message, kind) -- with two entrances: `alt-r` recalls the most recent exchange (prompt, code, or
-shell; immediacy makes this serve both "bad reply" and "typo'd cell") and `E` in the transcript
-view recalls any prompt (prompts only: reaching back is a conversation rewind; old code has no
-honest re-run story). Both fill the composer, switch the mode to match, and show a `↻` status
-cell. A kind-matched submit rewinds first -- the target and everything after it leave the dialog
-(`remove_msgs`) and the block model (`Compositor.remove_block`; ink in scrollback stays, the log
-is a log), and the save that follows writes the truncated dialog whole -- then the normal run
-path appends the fresh turn. A
-mismatched-kind submit or Esc disarms (truncating as a side effect of unrelated code would be a
-footgun). No dim, no orphan bookkeeping: the window shows the model as it now stands (Jeremy's
-call, overruling my dim-the-orphans lean -- dim means hidden, not deleted). `alt-up` keeps its
-existing force-history binding; retry lives on `alt-r`. Record surgery vs time travel: `e` edits
-in place with no re-run; `E`/`alt-r` rewind and re-run.
+**Retry / edit-and-resubmit (settled with Jeremy 2026-07-24, BUILT).** A retry state -- (target message, kind) -- with two entrances: `alt-r` recalls the most recent exchange (prompt, code, or shell; immediacy makes this serve both "bad reply" and "typo'd cell") and `E` in the transcript view recalls any prompt (prompts only: reaching back is a conversation rewind; old code has no honest re-run story). Both fill the composer, switch the mode to match, and show a `↻` status cell. A kind-matched submit rewinds first -- the target and everything after it leave the dialog (`remove_msgs`) and the block model (`Compositor.remove_block`; ink in scrollback stays, the log is a log), and the save that follows writes the truncated dialog whole -- then the normal run path appends the fresh turn. A mismatched-kind submit or Esc disarms (truncating as a side effect of unrelated code would be a footgun). No dim, no orphan bookkeeping: the window shows the model as it now stands (Jeremy's call, overruling my dim-the-orphans lean -- dim means hidden, not deleted). `alt-up` keeps its existing force-history binding; retry lives on `alt-r`. Record surgery vs time travel: `e` edits in place with no re-run; `E`/`alt-r` rewind and re-run.
 
-**Directory-scoped sessions (BUILT 2026-08, via session files; supersedes the sqlite-JOIN design
-of 2026-07-23).** Sessions live where they happen: one dialog `.ipynb` per session under the
-launch directory's `./.ipyai/sessions/`, so directory scoping is just the filesystem -- no shared
-db, no cwd JOIN. Plain `ipyai` always starts fresh; bare `-r` opens the chooser over this
-directory's files (digits choose, empty Enter picks the newest, `n` starts fresh), `-r PREFIX`
-resumes one by filename. History and ghost suggestions mine the same files, mode-scoped (code
-cells / prompts / shell cells per composer mode), so unrelated kernels' lines never leak in --
-the junk-suggestion symptom died with the shared db. The chooser stays cwd-only and renders as an
-in-flow `over` transient at startup: it evaporates without inking.
+**Directory-scoped sessions (BUILT 2026-08, via session files; supersedes the sqlite-JOIN design of 2026-07-23).** Sessions live where they happen: one dialog `.ipynb` per session under the launch directory's `./.ipyai/sessions/`, so directory scoping is just the filesystem -- no shared db, no cwd JOIN. Plain `ipyai` always starts fresh; bare `-r` opens the chooser over this directory's files (digits choose, empty Enter picks the newest, `n` starts fresh), `-r PREFIX` resumes one by filename. History and ghost suggestions mine the same files, mode-scoped (code cells / prompts / shell cells per composer mode), so unrelated kernels' lines never leak in -- the junk-suggestion symptom died with the shared db. The chooser stays cwd-only and renders as an in-flow `over` transient at startup: it evaporates without inking.
 
-**Jobs work: superseded.** The per-command jobs machinery (and its planned %jobs/M-j additions)
-was replaced wholesale by the persistent shell -- see "Shell layer". Being built now.
+**Jobs work: superseded.** The per-command jobs machinery (and its planned %jobs/M-j additions) was replaced wholesale by the persistent shell -- see "Shell layer". Being built now.
 
-**Load and resume are different features (settled).** `%ipyai load` / `-l` is starter
-templates: a curated file authored to be run — cells execute silently to rebuild kernel state
-(errors surface loudly), the dialog becomes the AI context, nothing paints; the file itself is
-the readable artifact, and `%ipyai` housekeeping cells are filtered on load and never recorded.
-Session resume (`-r`) is recall, the classic codex/claude convention: paint the transcript, run
-nothing — deliberately, since a transcript records what happened and was never curated for
-re-execution (side effects, cost, a vanished world). Resumed state stays cold by design; the
-two compose when needed: resume for the record, `%ipyai load` of a curated file for the state.
+**Load and resume are different features (settled).** `%ipyai load` / `-l` is starter templates: a curated file authored to be run — cells execute silently to rebuild kernel state (errors surface loudly), the dialog becomes the AI context, nothing paints; the file itself is the readable artifact, and `%ipyai` housekeeping cells are filtered on load and never recorded. Session resume (`-r`) is recall, the classic codex/claude convention: paint the transcript, run nothing — deliberately, since a transcript records what happened and was never curated for re-execution (side effects, cost, a vanished world). Resumed state stays cold by design; the two compose when needed: resume for the record, `%ipyai load` of a curated file for the state.
 
 **Smaller items:**
-- Style-level assertions work in the pytest harness: `EmuTty.term.style(x, y)` (pyghostty) reads
-  per-cell attributes and colors; see test_toggle_in_place's dim-count assert for the idiom.
-- Status line (settled 2026-07-24, being built): a single throbber cell at far left -- braille
-  spinner while busy, plain space idle -- replaces the `model responding... (C-C stops)` text
-  segment, making the line's content effectively constant-width (the truncation-policy question
-  evaporates with the long live segment). C-C discoverability moves into the hint text.
-  (Note-frontmatter var exposure from classic ipyai: considered and DROPPED 2026-07-24 -- the
-  per-prompt `$`var``/`!`cmd`` references are the whole story for injecting live values.)
+- Style-level assertions work in the pytest harness: `EmuTty.term.style(x, y)` (pyghostty) reads per-cell attributes and colors; see test_toggle_in_place's dim-count assert for the idiom.
+- Status line (settled 2026-07-24, being built): a single throbber cell at far left -- braille spinner while busy, plain space idle -- replaces the `model responding... (C-C stops)` text segment, making the line's content effectively constant-width (the truncation-policy question evaporates with the long live segment). C-C discoverability moves into the hint text. (Note-frontmatter var exposure from classic ipyai: considered and DROPPED 2026-07-24 -- the per-prompt `$`var``/`!`cmd`` references are the whole story for injecting live values.)
