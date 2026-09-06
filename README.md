@@ -1,105 +1,97 @@
 # teleprint
 
-A terminal UI library for apps built around a transcript: blocks print through to the terminal's own scrollback, a status bar and line editor repaint at the bottom, and everything in between stays clickable until it scrolls away. Written for AI CLIs and REPLs; `ipyai` is the reference app.
+A terminal UI library for applications built around a transcript. Output prints into the terminal's own scrollback, visible blocks remain interactive, and a status bar and line editor update at the bottom. It is written for AI CLIs and REPLs; `ipyai` is the reference application.
 
-The pieces:
+A chat or REPL session produces a growing sequence of inputs, responses, tool calls, and results. Readers need to follow new output, expand a result, enter the next request, and look back through earlier work. teleprint models that sequence as blocks and manages the transition from interactive output on screen to a printed record in scrollback.
 
-- a compositor that prints Rich-renderable blocks and repaints the visible ones in place (collapse/expand on click)
-- a line editor and a key/mouse/paste input parser
-- transcript mode on the alt screen: browse, search, and copy the block history (copy via OSC 52)
-- a borrow layer: foreground commands take the real tty; anything headless runs against an emulator mirror
-- widgets (status bar, signature panel) and a pyghostty-backed terminal emulator, so the whole surface is testable headlessly
+## The transcript model
 
-The design sections below are the founding notes, moved here verbatim; DEV.md keeps the development record.
+teleprint starts at the shell's cursor position and preserves the existing screen. As output grows, rows scroll into the terminal's history. Native terminal or tmux search, selection, and copy continue to work there. Quitting leaves the printed transcript behind.
 
-## Thesis
+The interface has three parts:
 
-Terminal UI libraries pick a center. Textual's center is the screen: a widget tree composited onto a canvas the app owns. prompt_toolkit's center is the prompt: a line editor that borrows the tty and gives it back. Our needs (ipyai: chat transcript, tool calls, status bar, input line) orbit neither — they orbit the transcript: an append-mostly document of blocks with a small mutable edge. Neither library models that, because each refuses half of it: Textual won't cede the screen to scrollback, pt won't model anything above the prompt. teleprint's center is the transcript, and the terminal's own scrollback is its durable rendering. The name records the model: a teleprinter prints every message onto durable paper as it arrives, printhead always at the live edge.
+- The visible transcript renders blocks from the current model. Blocks can stream, update, and collapse or expand while they remain in the active screen region.
+- The live tail contains the status bar and input editor. Completion menus and other transient controls appear near it. These controls do not become transcript output.
+- The transcript view uses the alternate screen to browse older blocks, search, expand, and copy them. Closing it restores the main screen. Other temporary views can use the same alternate-screen approach; an application records the resulting choice as a block when it belongs in the history.
 
-The invariant everything else derives from:
+Rows that enter native scrollback are written once. teleprint does not locate or repaint them later. A tool result can therefore remain interactive while visible and become ordinary terminal text as new output moves it off screen. A block that spans the top edge can still be toggled while part of it is visible. Repainting after a collapse can leave a short repeated section at the scrollback boundary; already printed rows stay unchanged.
 
-> There is one history — the printed transcript — and anything that scrolls is a view of it. Never a parallel world.
+The block model holds the current document. Scrollback records what was printed at the time. Editing or removing a block updates the model without rewriting that record. The transcript view renders the current model, including content hidden by collapsed blocks. Search can find that content and expand its block; copy uses the block's source text rather than wrapped terminal rows or box-drawing characters. Clipboard copy uses OSC 52.
 
-Contract form: the block model is the source of truth; the pane is its durable rendering; the pager is its live rendering; every gesture scrolls one of those two renderings and nothing else. This is the acceptance test for features: app-private scroll buffers, mutable history, and interaction paths that exist only in one rendering all fail it.
+## Why a transcript library
 
-Prior art that validates the block concept without occupying this slot: Warp (blocks, but by being the terminal emulator), Ink's Static/dynamic split (same committed/live division, no interactivity in the committed region, React-centered), Textual's inline mode (the repaint mechanics, but everything stays inside the app region and clears on exit). The strongest demand evidence: Claude Code (Ink/React) and codex (ratatui/Rust) independently converged on this exact surface grammar — print-through transcript, gutter-marked block types, repainted input-plus-status tail — and Claude Code ships the zone model precisely: its visible blocks are clickable (tool calls toggle open), going inert once scrolled. Every AI CLI is currently hand-rolling a private version of this core.
+A transcript-oriented application needs output to grow beyond the viewport while its visible portion remains interactive. Merely placing a UI below the shell prompt does not provide that behavior. An inline region that keeps its content within the application's viewport cannot substitute for printing rows into native scrollback as they leave the screen.
 
-## Surfaces
+[Textual](https://textual.textualize.io/guide/app/#run-inline) provides a widget-based application model, including inline mode. [prompt_toolkit](https://python-prompt-toolkit.readthedocs.io/en/stable/pages/full_screen_apps.html) provides line editing and full-screen application tools. teleprint specifically manages blocks that print through to scrollback, their visible interaction, and a separate live view of older content. The scrollback behavior is part of its contract, not an application-specific scrolling widget.
 
-Three surfaces, one rule each:
+teleprint uses Rich to render block content on both the main screen and in the transcript view. The compositor owns repainting and input dispatch. Applications can use Rich renderables without introducing a second content format for historical views.
 
-- **Durable** (main screen): printed blocks, append-only. Owned by the terminal/tmux once printed: native scroll, search, copy-mode, detach survival.
-- **Live tail** (bottom rows): status bar + input editor, diff-repainted in place every frame.
-- **Ephemeral** (alt screen): pager, pickers, modals. Leave no residue; only an *outcome block* enters the transcript (the decision, printed — like shell history recording the command, not the completion menu). fzf is the exemplar: transient full-screen moments don't make a tool a TUI; identity is where the app rests.
+The AI CLI use case supplies concrete requirements: streamed responses, collapsible tool results, responsive input during execution, and foreground commands that temporarily need the terminal. teleprint supplies the terminal UI independently of the execution protocol. ipyai combines it with Jupyter kernels and an AI conversation model; those are application choices, not requirements of teleprint.
 
-Within the main screen, two zones by mutability: **inked** (scrolled off-screen into the terminal's buffer; written once, immutable) and **visible** (redrawn from the block model on any change, so everything on screen is clickable -- folding a block simply repaints the screen from the model, however long ago it printed). The tail is part of the visible region and never enters history. Interactivity map: everything visible interactive; inked history native and inert (the transcript view for live access); alt-screen surfaces interactive while up.
+## Install and examples
 
-## Background work, tasks, and errors
+```bash
+pip install teleprint
+```
 
-A teleprint app is one event loop reading one tty. Key handlers run synchronously -- deciding what a key means takes microseconds and must happen in arrival order -- so anything slow (a kernel round trip, an AI turn) is *launched* from a handler, never awaited inline. The compositor owns the launching. Two rules cover every case, picked by one question: **what do you need back?**
+From a source checkout, run the [echo REPL](examples/repl.py):
 
-- **Nothing -- it should just happen** -> `comp.spawn(coro)`. In an `on_key` handler, simply `return` the coroutine: the dispatcher spawns it for you.
-- **A handle -- you will cancel it or check on it** -> keep `spawn`'s return value.
+```bash
+python examples/repl.py
+```
+
+It maintains an input line, prints submitted text and responses as blocks, and supports block toggling. [demo2.py](examples/demo2.py) demonstrates the compositor's scrollback and repaint behavior; [pyrepl.py](examples/pyrepl.py) connects a Python execution client.
+
+The main components are:
+
+- `Compositor`: prints and updates blocks, manages the live tail, and dispatches input.
+- `Block`: stores Rich-renderable content, source text, gutters, and collapsed state.
+- `Buffer` and the input parser: line editing plus key, mouse, paste, and terminal-response handling.
+- `TranscriptView`: browsing, searching, toggling, and copying the block model on the alternate screen.
+- Widgets for completion menus, tooltips, and signatures.
+- `RealTty` and `EmuTty`: real-terminal I/O and a pyghostty-backed terminal for headless tests.
+
+## Foreground commands and terminal ownership
+
+One component owns terminal input and output at a time. When an editor or foreground command needs the terminal, the application calls `comp.release()`, hands over I/O, then awaits `comp.reanchor()` when the command finishes. The compositor resumes below the command's output. Earlier output remains in history.
+
+`comp.record_block()` adds output that is already on the terminal to the block model without printing it a second time. The application owns process execution and output capture. In ipyai, shell processes and the emulator mirror used to capture their output belong to the shell integration; teleprint provides the terminal handoff operations.
+
+## Background work and errors
+
+Key handlers run synchronously in arrival order. Start slow work with `comp.spawn(coro)` to keep input responsive. What do you need back?
+
+- **Nothing — it should just happen:** call `comp.spawn(coro)`. In an `on_key` handler, return the coroutine and the dispatcher spawns it for you.
+- **A handle — you will cancel it or check on it:** keep `spawn`'s return value.
 
 ```python
 def on_key(k):
-    if k.name == 'tab': return complete()  # fire-and-forget: the dispatcher spawns it
+    if k.name == 'tab': return complete()
     elif k.name == 'enter':
-        state['run'] = comp.spawn(run_cell(buf.text), name='run')  # handle kept: ctrl-C cancels it
+        state['run'] = comp.spawn(run_cell(buf.text), name='run')
     elif k.name == 'ctrl+c' and state['run'] is not None:
         state['run'].cancel()
 ```
 
-Why `spawn` and never a bare `asyncio.create_task` in app code: asyncio holds only weak references to tasks, so a fire-and-forgotten task can be garbage-collected mid-flight, and an uncaught exception surfaces as a deferred "Task exception was never retrieved" splat on stderr -- which in raw mode garbles the composited screen, minutes after the cause. `spawn` keeps a strong reference until the task finishes and routes an uncaught failure to the one place the app chooses:
+`spawn` retains each task until completion. Set `on_task_error` to report uncaught failures through the UI instead of writing a traceback over the screen:
 
 ```python
 comp.on_task_error = lambda e, t: comp.print_block(f'{t.get_name()} failed: {e!r}', gutter=ERR)
 ```
 
-Unset, nothing is silenced: `spawn` deliberately does not retrieve the exception then, so asyncio's default report still fires (promptly, since the reference is released on completion). Cancellation is lifecycle, not failure -- a cancelled task never reaches the hook.
+Cancellation does not call this hook. Without a hook, failures retain asyncio's default reporting. Use a task created outside `spawn` when its owner awaits it and handles the exception itself; routing that failure through the hook as well would report it twice.
 
-The one legitimate bare `create_task` is a task whose exception its owner consumes at an `await` site, where the hook would double-report (ipyai's stream consumer is the canonical case). That code characteristically lives below the UI layer and has no compositor in reach -- so in app code, a bare `create_task` or a dropped handle reads as a bug at a glance.
+## Signals and testing
 
-## Signals
+`await comp.start()` installs signal handlers on the main thread; `comp.stop()` restores them. The handlers work as follows:
 
-`await comp.start()` takes them; `comp.stop()` gives them back. Apps register nothing:
+- **SIGWINCH:** calls `on_resize` when set, or resizes and repaints by default. An application with its own tail state should set `comp.on_resize = lambda: (comp.resize(), paint())`. During a terminal handoff, its resize handler can forward the new size to the foreground command instead of repainting over it.
+- **SIGINT:** enters key dispatch as `Key('ctrl+c')`.
+- **SIGTERM/SIGHUP:** restore the terminal before terminating with the default signal disposition.
 
-- **SIGWINCH** -> `comp.on_resize` if set, else adopt-the-size-and-repaint. Set the hook whenever the app owns tail state (every real app does): `comp.on_resize = lambda: (comp.resize(), paint())`. It owns the *whole* response, so during a borrow it can forward the winsize to the foreground job and skip the repaint that would garble the borrowed screen.
-- **SIGINT** -> synthesized as `Key('ctrl+c')` through normal dispatch. RealTty's cbreak keeps ISIG on, so ctrl-C arrives as a signal at rest but as an in-band byte during raw-mode borrows: either way `on_key` sees one `ctrl+c` key, and interrupt policy lives in exactly one branch.
-- **SIGTERM/SIGHUP** -> restore the terminal, then die by the default disposition: a killed TUI must not leave the user's terminal raw.
+Off the main thread, signal registration is skipped. `EmuTty` accepts seeded input and feeds output through a headless Ghostty terminal, including responses to terminal queries. Tests can inspect the resulting screen and scrollback without an interactive terminal.
 
-Signals register only on the main thread (a CPython constraint); elsewhere `start()` skips them silently, which is also why headless tests run unchanged.
-
-## Why not prompt_toolkit or Textual
-
-Beyond the centering argument:
-
-- **stdin has one owner.** CPR replies, keys, mouse, paste interleave unattributed on one fd. Our compositor needs CPR; pt's renderer also issues CPR and assumes it owns the read loop; the jobs relay and modals need the fd too. Embedding pt means demultiplexing stdin into someone else's framework assumptions (its `get_app()` application singleton, Application-owned loop) forever.
-- **One rendering dialect.** Rich renders every block everywhere. pt's formatted-text model would be a second dialect; two renderers for one document drift (the pandoc lesson: one center dialect).
-- The borrow contract — who owns stdin/stdout right now (tail at rest, job, modal, pager) — is the design's real center and exists in pt only implicitly (`in_terminal` chaining). Fresh code makes it a first-class object.
-
-What we crib rather than reinvent: pt's vt100 parser tables and quirk comments, CPR-timeout discipline, raw/cooked mode management, the shape of Buffer (text+cursor+undo as pure data); Textual's XTermParser (compact modern input parser) and inline-mode mechanics (cursor-up repaint, `ESC[6n` origin tracking, `ESC[J`, render to stderr); clikernel base.py's termios lore (ONLCR off for bare LF, ICANON off because canonical mode drops bytes past MAX_CANON with BEL spam; IEXTEN off because on BSD/macOS ^O is VDISCARD and the driver eats it — found when the demo's ctrl-O binding went dead). pt's external-command philosophy (`run_system_command`: yield the real tty, don't virtualize) confirms the jobs layer sits below any UI library.
-
-The pt lore harvest in detail (from `input/vt100.py` raw_mode, `application.py`, `renderer.py`, `output/flush_stdout.py` — read 2026-07-23, worth keeping even if pt itself isn't used):
-
-- **Raw mode is a delta, not `setraw`.** pt patches only what it means to change ("On OS X, `pty.setraw()` fails" — their comment): lflag clears ECHO | ICANON | IEXTEN | **ISIG** (ctrl-C/Z arrive as bytes; the app owns interrupt semantics), iflag clears **IXON | IXOFF** (or ctrl-S silently freezes output — the classic "my terminal is stuck") and **ICRNL | INLCR | IGNCR** (Enter arrives as `\r`, distinguishable from ctrl-J). It never touches oflag, unlike clikernel's ONLCR handling. Set **VMIN=1 explicitly**: on Solaris-family systems the VMIN slot aliases VEOF and defaults to 4, so reads mysteriously buffer.
-- **All tcgetattr/tcsetattr wrapped in try/except**: stdin may be /dev/null, an SSH pipe with no allocated tty, or closed mid-session ("Inappropriate ioctl for device").
-- **Cooked mode for borrows must restore ICRNL specifically** — without it, `input()` inside a borrowed terminal shows `^M` instead of accepting Enter.
-- **SIGWINCH belongs to the event loop** (`loop.add_signal_handler`, not `signal.signal`) and must be saved/restored around borrows, since the borrowed program may install its own. Backstop: **poll the size every 0.5s anyway** — SIGWINCH can't be delivered off the main thread or on Windows, and a resize during suspension is missed entirely.
-- **Suspend (ctrl-Z) is a borrow too**: pt's `suspend_to_background` runs *through* `run_in_terminal` — restore cooked mode, `os.kill(0, SIGTSTP)` (the whole process *group*, for piped-input cases), and raw mode re-establishes on SIGCONT return.
-- **SIGINT needs restoring at two levels**: the Python handler *and* the C-level one via `PyOS_getsig`/`PyOS_setsig` (stable ABI) — some embedders change the OS handler under Python.
-- **Writes need armor**: EINTR from a resize mid-write is ignorable (the resize repaint re-renders); make stdout blocking around writes (uvloop makes it non-blocking → `BlockingIOError` on big flushes); encode with `errors='replace'` (ascii locales exist).
-- **CPR discipline**: assume supported only after the first reply; probe with a 2s timer and mark NOT_SUPPORTED on silence (with a callback so the UI can adapt); track outstanding requests in a queue so replies pair with requests; skip CPR entirely for dumb terminals, non-tty stdout, or `$PROMPT_TOOLKIT_NO_CPR=1` (their pexpect escape hatch — we'll want the same for harness-driven runs); "it's nicer to draw bottom toolbars only once the height is known, to avoid flicker when the CPR response arrives."
-
-Line editing is the honest cost of going fresh: readline-emacs subset first (arrows, ctrl-a/e/k/u/w/y, alt-b/f, ctrl-r) — what ~99% of fingers use; vi mode later at most, as a mechanical crib of pt's binding tables. `!vim` through the jobs layer covers real editing.
-
-Multiline input scheme (decided 2026-07-23, replacing an earlier assumption that pt's checker behavior needed inventing): **Enter is smart, alt-enter is a newline, ctrl-O stays toggle.** Enter routes through IPython's `check_complete` (a `check` op on the stream protocol, answered worker-side -- which keeps IPython out of the UI process entirely, one step beyond today's ipyai, which needs a client-side TransformerManager because its kernel is remote): complete submits, incomplete inserts a continuation newline, invalid submits so execution shows the error. ipythonng's `check_complete` patch (single-line magic/alias commands count complete) rides into the worker shell. Alt-enter *always* inserts a newline, in both code and prompt mode -- the codex/Claude Code convention, and the first real typing path for multiline prompts (previously bracketed paste or F2-editor only; both remain). What stock IPython loses: meta-enter force-execute (double-Enter covers it) and ctrl-o insert-newline -- measured to be unknown even to a decades-long IPython user, so teleprint's toggle keeps the key. Findings for the record: ipyai has NO custom Enter handling today (it inherits jupyter_console's checker-driven behavior wholesale), and its multiline customization lives one layer over, in the transformer pipeline (`transform_prompt_mode`/`transform_dots`), which is routing, not completeness.
-
-## Install
-
-```bash
-pip install teleprint
-```
+The interface uses standard terminal cursor operations, mouse reporting, and bracketed paste. Applications should provide keyboard equivalents for mouse actions. Optional capabilities such as synchronized output improve presentation without changing the interaction model. See [DEV.md](DEV.md#compatibility) for compatibility targets and [the founding design notes](DESIGN.md) for parser, terminal-mode, and signal research. Historical proposals in those notes are not all part of the current library.
 
 ## Development
 
