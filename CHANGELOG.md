@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.4
+
+### New Features
+
+- Rework compositor API around keyed blocks: put/drop/extend/toggle, borrow context manager, and compositor-owned input, modes and signals ([#6](https://github.com/AnswerDotAI/teleprint/issues/6))
+
+
 ## 0.1.3
 
 ### Bugs Squashed
