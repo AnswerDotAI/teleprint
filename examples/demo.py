@@ -14,30 +14,29 @@ from rich.text import Text
 from teleprint.compositor import Compositor
 from teleprint.tty import RealTty
 
-HINT = 'click a #n line, ctrl-O toggles newest, ctrl-L recovers, q quits'
+HINT = 'click a » line, ctrl-O toggles newest, q quits'
 
 async def amain():
     t = RealTty()
-    t.write('\x1b[?1000;1006h')  # SGR mouse: clicks only, wheel stays native
     try:
-        comp = await Compositor(t).start()  # start owns the signals: WINCH -> on_resize, ctrl-C -> a key
+        comp = await Compositor(t).start()  # start owns the signals, mouse and paste modes, and reading input
         comp.set_tail(Text(f'teleprint demo -- {HINT}', style='reverse'), Text('> '))
         blocks = []
         GUT = (Text('» ', style='green'), Text('  '))
         def block(body):
-            blocks.append(comp.print_block(body, gutter=GUT))
+            blocks.append(comp.put(f'b{len(comp.blocks)}', body, gutter=GUT))
         def resized():
             comp.resize()  # width rewrap invalidated the map: everything demotes
-            comp.set_tail(Text(f'resized to {comp.cols}x{comp.rows} -- old blocks are history, ctrl-L revives recent ones', style='reverse'), Text('> '))
+            comp.set_tail(Text(f'resized to {comp.cols}x{comp.rows}', style='reverse'), Text('> '))
             block('printed after the resize, so this one is live\n(and toggleable)')
         comp.on_resize = resized
         for i in range(4):
             block(f'body line one of block {i}\nbody line two of block {i}')
             await asyncio.sleep(0.4)
-        stream = comp.print_block('streaming block (taller than your screen)', gutter=GUT)
+        stream = comp.put('stream', 'streaming block (taller than your screen)', gutter=GUT)
         blocks.append(stream)
         for i in range(comp.rows + 8):
-            comp.extend(stream, f'streamed line {i}')
+            comp.extend('stream', f'streamed line {i}')
             comp.set_tail(Text(f'streaming... {i}', style='reverse'), Text('> '))
             await asyncio.sleep(0.12)
         # fresh blocks after the stream, so clickable ones exist at rest even in a short pane
@@ -47,32 +46,21 @@ async def amain():
         if os.environ.get('TMUX'):  # wheel-up hands the gesture to tmux copy-mode (exits at bottom, clicks resume)
             comp.on_wheel = lambda d: subprocess.run(['tmux', 'copy-mode', '-eu']) if d < 0 else None
         done = asyncio.Event()
-        comp.on_key = lambda k: done.set() if k.name in ('q', 'ctrl+c') else None
-        t0 = time.monotonic()
-        loop = asyncio.get_running_loop()
-        def on_tty():
-            data = t.read(timeout=0)
-            if b'\x0f' in data:  # ctrl-O: toggle the newest un-committed block
+        def on_key(k):
+            if k.name in ('q', 'ctrl+c'): done.set()
+            elif k.name == 'ctrl+o':  # toggle the newest un-committed block
                 live = [b for b in blocks if not b.committed]
-                if live: comp.toggle(live[-1])
-                data = data.replace(b'\x0f', b'')
-            if b'\x0c' in data:  # ctrl-L: the recovery gesture -- clear, reprint recent blocks live
-                comp.clear(*blocks[-3:])
-                comp.set_tail(Text(f'recovered: last {min(len(blocks),3)} blocks live again -- {HINT}', style='reverse'), Text('> '))
-                data = data.replace(b'\x0c', b'')
-            comp.on_bytes(data)
-        loop.add_reader(t.fd, on_tty)
+                if live: comp.toggle(live[-1].key)
+        comp.on_key = on_key
+        t0 = time.monotonic()
         try:
             while not done.is_set():
                 try: await asyncio.wait_for(done.wait(), 1.0)
                 except asyncio.TimeoutError:
-                    comp.flush_input()
                     comp.set_tail(Text(f'idle {int(time.monotonic()-t0)}s -- {HINT}', style='reverse'), Text('> '))
-        finally:
-            loop.remove_reader(t.fd)
-            comp.stop()
+        finally: comp.stop()
     finally:
-        t.write('\x1b[?1000;1006l\r\n')
+        t.write('\r\n')
         t.restore()
 
 if __name__ == '__main__':

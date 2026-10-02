@@ -25,11 +25,10 @@ def _text(t): return ''.join(t) if isinstance(t, list) else (t or '')
 
 async def amain():
     t = RealTty()
-    t.write('\x1b[?1000;1006h\x1b[?2004h')
     try:
         async with await JupyAsyncKernelClient.connect(GATEWAY, cwd=os.getcwd()) as kc: await repl(t, kc)
     finally:
-        t.write('\x1b[?2004l\x1b[?1000;1006l\r\n')
+        t.write('\r\n')
         t.restore()
 
 async def repl(t, kc):
@@ -37,7 +36,10 @@ async def repl(t, kc):
     comp = await Compositor(t).start()
     state = dict(stream=None, menu=None, run=None)
     done = asyncio.Event()
-    loop = asyncio.get_running_loop()
+
+    def put(*body, **kw):
+        "Append a block under the next free key: this REPL never replaces a block once printed."
+        return comp.put(f'b{len(comp.blocks)}', *body, **kw)
 
     def paint():
         lines = [Text(HINT if state['run'] is None else 'running... (ctrl-C interrupts)', style='reverse')]
@@ -48,14 +50,14 @@ async def repl(t, kc):
     def on_out(o):
         ot = o.get('output_type')
         if ot == 'stream':
-            if state['stream'] is None: state['stream'] = comp.print_block(gutter=(Text('« ', style='cyan'), Text('  ')))
+            if state['stream'] is None: state['stream'] = put(gutter=(Text('« ', style='cyan'), Text('  '))).key
             txt = _text(o.get('text')).rstrip('\n')
             if txt: comp.extend(state['stream'], txt)
         elif ot in ('execute_result', 'display_data'):
             data = o.get('data', {})
-            if 'image/png' in data: comp.print_block('[image output -- see ipyai for kitty rendering]')
-            elif 'text/plain' in data: comp.print_block(_text(data['text/plain']))
-        elif ot == 'error': comp.print_block(Text.from_ansi('\n'.join(o.get('traceback', []))))
+            if 'image/png' in data: put('[image output -- see ipyai for kitty rendering]')
+            elif 'text/plain' in data: put(_text(data['text/plain']))
+        elif ot == 'error': put(Text.from_ansi('\n'.join(o.get('traceback', []))))
 
     async def run_cell(code):
         try:
@@ -81,12 +83,12 @@ async def repl(t, kc):
             return
         if k.name == 'ctrl+o':
             live = [b for b in comp.blocks.values() if not b.committed]
-            if live: comp.toggle(live[-1])
+            if live: comp.toggle(live[-1].key)
         elif k.name == 'ctrl+c':  # in-band or synthesized from SIGINT: one surface either way
             if state['run'] is not None: comp.spawn(kc.interrupt_kernel(), name='interrupt')
             else: buf.clear()
         elif k.name == 'enter' and buf.text and state['run'] is None:
-            comp.print_block(Text(buf.text), gutter=(Text('» ', style='green'), Text('  ')))
+            put(Text(buf.text), gutter=(Text('» ', style='green'), Text('  ')))
             state.update(stream=None, menu=None)
             state['run'] = comp.spawn(run_cell(buf.text), name='run')  # handle kept: it gates ctrl-C and teardown
             buf.clear()
@@ -98,21 +100,12 @@ async def repl(t, kc):
             buf.handle(k)
         paint()
 
-    def on_tty():
-        data = t.read(timeout=0)
-        if data: comp.on_bytes(data)
-
     comp.on_key = on_key
     comp.on_paste = lambda text: (buf.insert(text), paint())
     comp.on_resize = lambda: (comp.resize(), paint())  # app tail state: own the whole resize response
-    loop.add_reader(t.fd, on_tty)
     paint()
-    try:
-        while not done.is_set():   # the input parser needs periodic flushes (esc disambiguation)
-            try: await asyncio.wait_for(done.wait(), 0.2)
-            except asyncio.TimeoutError: comp.flush_input()
+    try: await done.wait()
     finally:
-        loop.remove_reader(t.fd)
         comp.stop()
         if state['run'] is not None: state['run'].cancel()
 

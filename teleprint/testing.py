@@ -1,7 +1,6 @@
 "Test harness: an emulated tty backed by pyghostty, for headless compositor tests."
 from collections import deque
-from pyghostty import Terminal, ffi, lib
-from pyghostty._ffi import check
+from pyghostty import Terminal
 
 class EmuTty:
     """The app's side of a terminal, emulated: writes feed a headless Ghostty, reads
@@ -10,15 +9,9 @@ class EmuTty:
     The write/read/size/flush surface is the draft borrow-contract tty interface:
     whatever owns the terminal at a given moment holds exactly this object."""
     def __init__(self, cols=80, rows=24, scrollback=10_000, bg=None):
-        self.term = Terminal(cols, rows, scrollback)
+        self.term = Terminal(cols, rows, scrollback, bg=bg)  # with `bg` set, the emulator answers OSC 11 queries (theme detection)
         self._input = deque()
-        # The emulator's query responses ("written back to the pty") become readable input.
-        self._on_pty = ffi.callback('void(GhosttyTerminal, void*, const uint8_t*, size_t)',
-                                    lambda t,u,d,n: self._input.append(ffi.buffer(d,n)[:]))
-        check(lib.ghostty_terminal_set(self.term._t[0], lib.GHOSTTY_TERMINAL_OPT_WRITE_PTY, self._on_pty), 'set write_pty')
-        if bg is not None:  # a configured background makes the emulator answer OSC 11 queries (theme detection)
-            c = ffi.new('GhosttyColorRgb*', dict(zip('rgb', bg)))
-            check(lib.ghostty_terminal_set(self.term._t[0], lib.GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, c), 'set bg')
+        self.term.on_reply(self._input.append)
 
     def write(self, data):
         "App output: feed the emulator; any query responses queue for `read`."

@@ -48,8 +48,7 @@ NOTE = 'click/alt-digit toggles · n adds · r runs · m modal · c menu · x cl
 
 async def amain():
     tty = RealTty()
-    tty.write('\x1b[?1000;1006h')                 # SGR mouse on; teleprint parses the events
-    comp = await Compositor(tty).start()          # start owns the signals: WINCH -> on_resize, ctrl-C -> a key
+    comp = await Compositor(tty).start()          # start owns the signals, mouse and paste modes, and reading input
     comp.numbering = True
     feed = iter(EXCHANGES)
     state = dict(mode='code', menu=False, modal=False, run=None)
@@ -57,7 +56,7 @@ async def amain():
 
     def add():
         for kind, text in next(feed, []):
-            comp.print_block(text, gutter=GUT[kind], tag=kind, collapse_at=comp.rows // 2)
+            comp.put(f'b{len(comp.blocks)}', text, gutter=GUT[kind], collapse_at=comp.rows // 2)
 
     def transients():
         if state['modal']: return list(MODAL)
@@ -83,7 +82,7 @@ async def amain():
             done.set()
         elif k.name == 'n' and not state['modal']: add(); paint()
         elif k.name == 'r' and state['run'] is None:
-            comp.print_block('slow_work()', gutter=GUT['inp'], tag='inp')
+            comp.put(f'b{len(comp.blocks)}', 'slow_work()', gutter=GUT['inp'])
             state['run'] = (time.monotonic(), 0)
             paint()
         elif k.name == 'm': state['modal'] = True; paint()
@@ -91,32 +90,29 @@ async def amain():
         elif k.name == 'x' and (state['modal'] or state['menu']):
             state.update(modal=False, menu=False); paint()
         elif k.name.startswith('alt+') and k.name[4:] in comp.numbered:
-            comp.toggle(comp.blocks[comp.numbered[k.name[4:]]])
+            comp.toggle(comp.numbered[k.name[4:]])
 
     comp.on_key = on_key
     comp.on_act = lambda token: (state.update(mode='prompt' if state['mode'] == 'code' else 'code'), paint())
     comp.on_wheel = lambda d: subprocess.run(['tmux', 'copy-mode', '-eu']) if d < 0 and os.environ.get('TMUX') else None
     comp.on_resize = lambda: (comp.resize(), paint())
 
-    loop = asyncio.get_running_loop()
-    loop.add_reader(tty.fd, lambda: comp.on_bytes(os.read(tty.fd, 1024)))
     for _ in range(5): add()
     paint()
     try:
         while not done.is_set():
             try: await asyncio.wait_for(done.wait(), 0.1 if state['run'] else 0.25)
-            except asyncio.TimeoutError: comp.flush_input()
+            except asyncio.TimeoutError: pass  # the spinner animates on this wake-up
             if state['run']:
                 t, i = state['run']
                 if time.monotonic() - t > 3:
                     state['run'] = None
-                    comp.print_block(f'slow_work finished in {time.monotonic() - t:.1f}s', gutter=GUT['out'], tag='out')
+                    comp.put(f'b{len(comp.blocks)}', f'slow_work finished in {time.monotonic() - t:.1f}s', gutter=GUT['out'])
                 else: state['run'] = (t, i + 1)
                 paint()
     finally:
-        loop.remove_reader(tty.fd)
         comp.stop()
-        tty.write('\x1b[?1000;1006l\r\n')
+        tty.write('\r\n')
         tty.restore()
 
 if __name__ == '__main__':

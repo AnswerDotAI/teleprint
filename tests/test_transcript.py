@@ -15,7 +15,7 @@ async def make(cols=32, rows=8):
 
 async def test_transcript_browse_toggle_and_leave():
     tty, comp = await make()
-    bs = [comp.print_block(f'top {i}\nbot {i}', gutter=G) for i in range(6)]
+    bs = [comp.put(f'b{i}', f'top {i}\nbot {i}', gutter=G) for i in range(6)]
     main_before = tty.term.text()
     tv = TranscriptView(comp, lambda: ([Text('[transcript]')], None))
     comp.on_mouse = tv.on_mouse
@@ -28,17 +28,20 @@ async def test_transcript_browse_toggle_and_leave():
     comp.on_bytes(b'\x1b[<0;2;%dM' % (row + 1))            # click a COMMITTED block: toggleable here
     assert bs[1].collapsed
     assert '… (+1 lines)' in tty.term.text()
+    folds = [b.collapsed for b in bs]
+    comp.on_bytes(b'\x1b[<0;2;8M')                          # click the tail row below the view: no block toggles
+    assert [b.collapsed for b in bs] == folds
     tv.leave()
     assert tty.term.text() == main_before                  # main screen untouched: alt leaves no residue
 
 async def test_transcript_composer_cursor_and_resync():
     tty, comp = await make()
-    b1 = comp.print_block('alpha\nbeta', gutter=G)
-    b2 = comp.print_block('gamma\ndelta', gutter=G)
+    b1 = comp.put('b1', 'alpha\nbeta', gutter=G)
+    b2 = comp.put('b2', 'gamma\ndelta', gutter=G)
     buf = ['']
     tv = TranscriptView(comp, lambda: ([Text('> ' + buf[0])], (0, 2 + len(buf[0]))))
     tv.enter()
-    assert tv.cur == b2.id
+    assert tv.cur == b2.key
     buf[0] = 'typed'
     tv.draw()
     scr = tty.term.text().splitlines()
@@ -55,19 +58,19 @@ def K(ch): return Key(ch, ch)
 
 async def test_transcript_search_motion_copy():
     tty, comp = await make(cols=40, rows=10)
-    b0 = comp.print_block('alpha\nhidden needle here', gutter=G)
-    b1 = comp.print_block('beta\nsecond needle', gutter=G)
-    b2 = comp.print_block('gamma\ndelta', gutter=G, source='SRC = gamma')
-    comp.toggle(b0)
+    b0 = comp.put('b0', 'alpha\nhidden needle here', gutter=G)
+    b1 = comp.put('b1', 'beta\nsecond needle', gutter=G)
+    b2 = comp.put('b2', 'gamma\ndelta', gutter=G, source='SRC = gamma')
+    comp.toggle('b0')
     assert b0.collapsed
     tv = TranscriptView(comp, lambda: ([Text('> ')], (0, 2)))
     tv.enter()
-    assert tv.cur == b2.id
+    assert tv.cur == b2.key
     assert tv.on_key(K('/'))
     for ch in 'needle': tv.on_key(K(ch))
     assert '/needle' in tty.term.text()          # the search prompt is visible
     tv.on_key(Key('enter'))
-    assert tv.cur == b0.id and not b0.collapsed  # wrapped forward to the first match, expanded on landing
+    assert tv.cur == b0.key and not b0.collapsed  # wrapped forward to the first match, expanded on landing
     assert 'hidden needle here' in tty.term.text()
     scr = tty.term.text().splitlines()
     row = next(i for i, l in enumerate(scr) if 'hidden needle' in l)
@@ -75,17 +78,17 @@ async def test_transcript_search_motion_copy():
     assert tty.term.style(col, row)['inverse']           # the found text is highlighted in place
     assert not tty.term.style(col - 3, row)['inverse']   # surrounding text is not
     tv.on_key(K('n'))
-    assert tv.cur == b1.id                       # next match
+    assert tv.cur == b1.key                       # next match
     tv.on_key(K('N'))
-    assert tv.cur == b0.id                       # reverse
+    assert tv.cur == b0.key                       # reverse
     tv.on_key(K('G'))
-    assert tv.cur == b2.id
+    assert tv.cur == b2.key
     tv.on_key(K('g'))
-    assert tv.cur == b0.id
+    assert tv.cur == b0.key
     tv.on_key(K('/'))
     for ch in 'SRC': tv.on_key(K(ch))
     tv.on_key(Key('enter'))
-    assert tv.cur == b2.id                       # matched the stored source, not the rendering
+    assert tv.cur == b2.key                       # matched the stored source, not the rendering
     writes, w = [], tty.write
     tty.write = lambda d: (writes.append(d), w(d))
     tv.on_key(K('y'))
@@ -94,7 +97,7 @@ async def test_transcript_search_motion_copy():
 
 async def test_transcript_compose_focus():
     tty, comp = await make()
-    comp.print_block('alpha\nbeta', gutter=G)
+    comp.put('b', 'alpha\nbeta', gutter=G)
     tv = TranscriptView(comp, lambda: ([Text('> ')], (0, 2)))
     tv.enter()
     assert not tv.on_key(K('x'))                 # unbound printable: host inserts it (transparent composing)
@@ -106,24 +109,34 @@ async def test_transcript_compose_focus():
     assert tv.on_key(K('i'))                     # explicit compose entry
     assert tv.composing
 
-async def test_follow_mode_and_paused_frames():
-    "Enter follows the tail; blocks printed during the view stream into it (main-screen frames stay model-only); navigation unpins, G re-pins; leave paints the backlog once."
+async def test_view_keeps_app_change_hook():
+    "The open view takes on_change but still calls the app's hook, and leave gives the hook back."
     tty, comp = await make()
-    comp.print_block('first', gutter=G)
+    calls = []
+    app_hook = lambda: calls.append(1)
+    comp.on_change = app_hook
+    tv = TranscriptView(comp, lambda: ([Text('[t]')], None))
+    tv.enter()
+    comp.put('b', 'streamed in', gutter=G)
+    assert calls == [1] and 'streamed in' in tty.term.text()
+    tv.leave()
+    assert comp.on_change is app_hook
+async def test_follow_mode_and_paused_frames():
+    "Enter follows the tail; blocks put during the view reach it through on_change (main-screen frames stay model-only); navigation unpins, G re-pins; leave paints the backlog once."
+    tty, comp = await make()
+    comp.put('first', 'first', gutter=G)
     tv = TranscriptView(comp, lambda: ([Text('[t]')], None))
     tv.enter()
     assert tv.follow
-    alt_before = tty.term.text()
-    b = comp.print_block('streamed in', gutter=G)
-    tv.notify(); tv.draw()
+    comp.put('b', 'streamed in', gutter=G)
     scr = tty.term.text()
-    assert 'streamed in' in scr and tv.cur == b.id     # the view tracked the tail...
+    assert 'streamed in' in scr and tv.cur == 'b'      # the view tracked the tail by itself...
     assert '> ' not in scr.splitlines()[0]             # ...and no main-screen frame bled onto the alt screen
     tv.move(-1)
     assert not tv.follow                               # navigation unpins
-    comp.print_block('while unpinned', gutter=G)
-    tv.notify(); tv.draw()
-    assert 'while unpinned' not in tty.term.text()     # unpinned: the view holds still
+    top, cur = tv.top, tv.cur
+    comp.put('u', 'while unpinned', gutter=G)
+    assert (tv.top, tv.cur) == (top, cur)              # unpinned: the view keeps its place
     tv.jump(True)
     assert tv.follow and 'while unpinned' in tty.term.text()   # G re-pins to the tail
     tv.leave()

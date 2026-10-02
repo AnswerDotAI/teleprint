@@ -1,5 +1,6 @@
 "The compositor: renders the visible tail of the block document from the model; scrollback is a write-once record."
-import asyncio, os, signal, time
+import asyncio, os, re, signal, time
+from contextlib import asynccontextmanager
 from rich.console import Console
 from rich.cells import cell_len
 from rich.segment import Segment
@@ -17,19 +18,21 @@ class Compositor:
     again. Shrink slides the window back and already-inked rows repaint in their current state
     (policy 2), so everything visible stays live and clickable.
 
+    The app names each block with a key (`put`). `blocks` holds them in document order; the
+    epoch is the run of blocks still in the screen document, until `commit` or `borrow` ends it.
+
     Paint state: `_top` (screen row of the region origin, worn down to 0 as scrolls absorb the
     shell's rows), `_ws` (document rows inked so far), and the per-frame screen map for clicks.
-    The single CPR runs at `start` (and again at `reanchor`, the same quiet boundary) to learn
-    the origin; both await it, but nothing else is ever in flight there, so there is no race."""
+    The single CPR runs at `start` (and again when a `borrow` ends, the same quiet boundary) to
+    learn the origin; both await it, but nothing else is ever in flight there, so there is no race."""
     def __init__(self, tty):
         self.tty = tty
         self._adopt_size()
-        self.blocks = {}
-        self._epoch = []      # ids of the blocks forming the current screen document (reset by a borrow)
-        self._next_id = 1
+        self.blocks = {}      # key -> Block, in document order
+        self._epoch = []      # keys of the blocks forming the current screen document, in document order
         self._ws = 0          # document rows inked into scrollback
         self._top = 0         # screen row of the region origin
-        self._screen = []     # per screen row: the (bid, segs) entry painted there this frame
+        self._screen = []     # per screen row: the (key, segs) entry painted there this frame
         self._tail = []       # rendered tail entries [(None, segs), ...]
         self._tail_cursor = None
         self._over = []       # rendered transient entries, laid out directly above the tail; never ink
@@ -42,11 +45,17 @@ class Compositor:
         self.on_mouse = None  # callable(Mouse) -> bool handled: lets a mode take the mouse over click/wheel defaults
         self.on_act = None    # callable(token): a click landed on tail/transient chrome carrying Style(meta={'act': token})
         self.on_task_error = None  # callable(exc, task): a spawned task failed; unset -> asyncio's default report
-        self.on_resize = None  # callable(): SIGWINCH; unset -> self.resize(). Set it to own the whole response (apps with tail state, borrows)
+        self.on_resize = None  # callable(): SIGWINCH; unset -> self.resize(). Set it to own the whole response (apps with tail state)
+        self.on_change = None  # callable(): put, drop or extend changed the document (TranscriptView follows through it)
         self._tasks = set()   # strong refs to spawned tasks: asyncio's registry holds only weak ones
         self._signals = []    # signals start() registered on the loop, removed by stop()
+        self._modes = []      # DEC private modes set through set_modes, reset by stop and by fatal signals
+        self._reading = False # whether the tty reader is installed (real ttys only; borrow and query suspend it)
+        self._ticker = None   # the input-flush task running while the reader is installed
+        self._borrowing = False
+        self._borrow_resize = None  # borrow's on_resize: SIGWINCH goes here while the terminal is lent
         self.numbering = False  # apps opt in: newest visible toggleable blocks wear alt-digit numbers
-        self.numbered = {}     # per-frame {digit str: block id}, for the app's alt-digit binding
+        self.numbered = {}     # per-frame {digit str: block key}, for the app's alt-digit binding
         self.paused = False   # an alt-screen surface owns the tty (transcript view): frames are model-only until unpause
 
     def _adopt_size(self):
@@ -65,31 +74,92 @@ class Compositor:
 
     # -- input side -----------------------------------------------------------
     async def _ask_cursor(self, timeout=2.0):
-        "The one CPR round-trip, used only at quiet boundaries (start, reanchor) where nothing else is in flight."
+        "The one CPR round-trip, used only at quiet boundaries (start, the end of a borrow). Input read while waiting, before or after the reply, is dispatched, not lost."
         self.tty.write('\x1b[6n')
         deadline = time.monotonic() + timeout
         while True:
-            for ev in self._parser.feed(self.tty.read()):
-                if isinstance(ev, CPR): return ev.row, ev.col
-                self._dispatch(ev)  # keys typed while we waited are not lost
+            evs = self._parser.feed(self.tty.read())
+            cpr = next((ev for ev in evs if isinstance(ev, CPR)), None)
+            for ev in evs:
+                if ev is not cpr: self._dispatch(ev)
+            if cpr is not None: return cpr.row, cpr.col
             if time.monotonic() >= deadline: raise RuntimeError(f'no CPR reply within {timeout}s')
             await asyncio.sleep(0)  # yield between the short blocking reads: the loop stays live at the boundary
 
-    async def start(self):
-        "Adopt the tty and the loop: learn the region origin (the shell's cursor row), then take the signals owned here."
+    async def _anchor(self):
+        "Learn the region origin: the cursor's row, or the next row when the cursor is mid-line."
         row, col = await self._ask_cursor()
         if col:
             self.tty.write('\r\n')
             row = min(row + 1, self.rows - 1)
         self._top = row
+
+    async def query(self, payload, until, timeout=0.5):
+        """Write the terminal query `payload`, then read input until the bytes regex `until` matches it or
+        `timeout` seconds pass, returning the bytes read. Keys and other input in those bytes are still dispatched."""
+        reading = self._reading
+        self._reader_off()
+        try:
+            self.tty.write(payload)
+            data, end = b'', time.monotonic() + timeout
+            while time.monotonic() < end:
+                if new := self.tty.read():
+                    data += new
+                    for ev in self._parser.feed(new): self._dispatch(ev)
+                    if re.search(until, data): break
+                else: await asyncio.sleep(0.005)
+            return data
+        finally:
+            if reading: self._reader_on()
+
+    async def start(self):
+        """Adopt the tty and the loop: learn the region origin (the shell's cursor row), take the signals, turn
+        on SGR mouse reporting and bracketed paste, and on a real tty start reading input."""
+        await self._anchor()
         self._register_signals()
+        self.set_modes(1000, 1006, 2004)
+        self._reader_on()
         return self
 
     def stop(self):
-        "Release what start() took from the loop: the signal handlers. Kept task handles stay the app's to cancel."
+        "Give back what start() took: the reader, the terminal modes and the signal handlers. Other kept task handles stay the app's to cancel."
+        self._reader_off()
+        self._reset_modes()
         loop = asyncio.get_running_loop()
         for sig in self._signals: loop.remove_signal_handler(sig)
         self._signals.clear()
+
+    def set_modes(self, *modes, on=True):
+        "Set DEC private `modes` (reset them with `on=False`). Modes left set are reset by `stop` and by fatal signals."
+        if not modes: return
+        self.tty.write(f'\x1b[?{";".join(map(str, modes))}{"h" if on else "l"}')
+        for m in modes:
+            if m in self._modes: self._modes.remove(m)
+            if on: self._modes.append(m)
+
+    def _reset_modes(self):
+        "Reset every mode still set, newest first (the alternate screen before mouse reporting)."
+        if self._modes: self.tty.write(f'\x1b[?{";".join(map(str, reversed(self._modes)))}l')
+        self._modes = []
+
+    def _reader_on(self):
+        "On a real tty, read input as it arrives and resolve pending escapes on a 0.2 s tick. Test ttys have no `fd`: tests feed `on_bytes` directly."
+        fd = getattr(self.tty, 'fd', None)
+        if fd is None or self._reading: return
+        asyncio.get_running_loop().add_reader(fd, lambda: self.on_bytes(os.read(fd, 4096)))
+        self._ticker = self.spawn(self._flush_tick(), name='input-flush')
+        self._reading = True
+
+    def _reader_off(self):
+        if not self._reading: return
+        asyncio.get_running_loop().remove_reader(self.tty.fd)
+        self._ticker.cancel()
+        self._reading, self._ticker = False, None
+
+    async def _flush_tick(self):
+        while True:
+            await asyncio.sleep(0.2)
+            self.flush_input()
 
     def spawn(self, coro, name=None):
         """Schedule background work from sync UI code: create the task, keep it alive (asyncio holds
@@ -118,11 +188,14 @@ class Compositor:
             self._signals.append(sig)
 
     def _on_winch(self):
-        if self.on_resize: self.on_resize()
+        if self._borrowing:
+            if self._borrow_resize: self._borrow_resize()
+        elif self.on_resize: self.on_resize()
         else: self.resize()
 
     def _fatal(self, sig):
-        "A fatal signal: put the terminal back first, then die by the default disposition so the exit status stays honest."
+        "A fatal signal: reset the terminal modes and put the tty back first, then die by the default disposition so the exit status stays honest."
+        self._reset_modes()
         self.tty.restore()
         signal.signal(sig, signal.SIG_DFL)
         os.kill(os.getpid(), sig)
@@ -132,7 +205,7 @@ class Compositor:
         for ev in self._parser.feed(data): self._dispatch(ev)
 
     def flush_input(self):
-        "Resolve a pending lone ESC as the escape key (call after the event loop's read timeout)."
+        "Resolve a pending escape whose wait has run out (the reader's tick calls this on a real tty; tests call it directly)."
         for ev in self._parser.flush(): self._dispatch(ev)
 
     def _dispatch(self, ev):
@@ -156,7 +229,7 @@ class Compositor:
         if not e: return  # unpainted rows are not click targets
         for s in e[1]:
             meta = s.style.meta if s.style else {}
-            if 'toggle' in meta: return self.toggle(self.blocks[meta['toggle']])
+            if 'toggle' in meta: return self.toggle(meta['toggle'])
             if 'act' in meta and self.on_act: return self.on_act(meta['act'])
 
     # -- rendering ------------------------------------------------------------
@@ -179,11 +252,11 @@ class Compositor:
         blk._first = lines[0] if lines else []
         return lines
 
-    def _gutter_segs(self, g, live, bid):
-        "The gutter as segments; live gutters carry the toggle click target."
+    def _gutter_segs(self, g, key):
+        "The gutter as segments, carrying the block's toggle click target."
         gt = g.copy() if isinstance(g, Text) else Text(str(g))
         if not gt.plain: return []
-        if live: gt.stylize(Style(meta={'toggle': bid}))
+        gt.stylize(Style(meta={'toggle': key}))
         return self._render(gt)[0]
 
     def _summary_suffix(self, hidden): return self._render(Text(f' … (+{hidden} lines)', style='dim'))[0]
@@ -193,50 +266,44 @@ class Compositor:
         if sum(cell_len(s.text) for s in line) > self.cols: return Segment.adjust_line_length(line, self.cols)
         return line
 
-    def _block_lines(self, blk, live=None):
-        "Content-first presentation rows: gutter + body lines (a padded block leads with one blank row); collapsed shows line one plus a dim count."
+    def _row(self, blk, i, segs, gutter=None):
+        """Presentation row for content line `i` of `blk`: its gutter (or `gutter`, e.g. a numbered one), the
+        content `segs`, and on a collapsed block's first line the dim count of hidden lines. A dim block's row
+        is dim throughout. Cropped to the width."""
+        g = gutter if gutter is not None else blk.gutter[0 if i == 0 else 1]
+        line = self._gutter_segs(g, blk.key) + list(segs)
+        if i == 0 and blk.collapsed and blk.height > 1: line += self._summary_suffix(blk.height - 1)
+        if blk.dim: line = [Segment(s.text, (s.style or Style()) + Style(dim=True)) for s in line]
+        return (blk.key, self._fit(line))
+
+    def _block_lines(self, blk):
+        "Content-first presentation rows: a blank pad row if the block has one, then line one when collapsed, else every line."
         lines = self._content_lines(blk)
-        if live is None: live = len(lines) > 1
-        else: live = live and len(lines) > 1
-        first_g, cont_g = blk.gutter
-        out = [(blk.id, [])] if blk.pad else []
         shown = lines[:1] if blk.collapsed else lines
-        for i, segs in enumerate(shown):
-            g = self._gutter_segs(first_g if i == 0 else cont_g, live, blk.id)
-            line = g + list(segs)
-            if blk.collapsed and i == 0 and len(lines) > 1: line += self._summary_suffix(len(lines) - 1)
-            if blk.dim: line = [Segment(s.text, (s.style or Style()) + Style(dim=True)) for s in line]
-            out.append((blk.id, self._fit(line)))
-        return out
+        return ([(blk.key, [])] if blk.pad else []) + [self._row(blk, i, segs) for i, segs in enumerate(shown)]
 
     def _block_rows(self, blk):
         "Presentation rows from the per-block cache, rebuilt when stale (model changed or width changed)."
-        if getattr(blk, '_rows', None) is None or blk._rw != self.cols: blk._rows, blk._rw = self._block_lines(blk), self.cols
+        if blk._rows is None or blk._rw != self.cols: blk._rows, blk._rw = self._block_lines(blk), self.cols
         return blk._rows
 
     def _dirty(self, blk): blk._rows = None
 
     def _doc_rows(self):
         out, self._spans = [], {}
-        for bid in self._epoch:
-            rows = self._block_rows(self.blocks[bid])
-            self._spans[bid] = (len(out), len(rows))
+        for key in self._epoch:
+            rows = self._block_rows(self.blocks[key])
+            self._spans[key] = (len(out), len(rows))
             out += rows
         return out
 
-    def _numbered_row(self, blk, d):
-        """Row 0 of `blk` with digit `d` in the gutter's middle cell (`»»»` -> `»4»`). Needs a
-        first-line gutter of >= 3 chars; keeps its base style (spans are not preserved: gutters
-        are single-styled by convention)."""
-        g = blk.gutter[0]
+    def _digit_gutter(self, g, d):
+        """Gutter `g` with digit `d` in its middle cell (`»»»` -> `»4»`), or None when `g` is under 3 cells.
+        Keeps the base style only: gutters are single-styled by convention."""
         gt = g.copy() if isinstance(g, Text) else Text(str(g))
         p = gt.plain
         if len(p.rstrip()) < 3: return None
-        nt = Text(p[0] + str(d) + p[2:], style=gt.style)
-        nt.stylize(Style(meta={'toggle': blk.id}))
-        line = self._render(nt)[0] + list(blk._first)
-        if blk.collapsed and blk.height > 1: line += self._summary_suffix(blk.height - 1)
-        return (blk.id, self._fit(line))
+        return Text(p[0] + str(d) + p[2:], style=gt.style)
 
     def _number(self, rows, ws):
         """Assign digits 0..9 to the newest visible toggleable blocks, newest first, substituting
@@ -245,16 +312,16 @@ class Compositor:
         nothing to toggle and are skipped without consuming a digit."""
         self.numbered = {}
         d = 0
-        for bid in reversed(self._epoch):
+        for key in reversed(self._epoch):
             if d > 9: break
-            start, cnt = self._spans[bid]
+            start, cnt = self._spans[key]
             if start + cnt <= ws: break   # this block and everything older sit above the window
-            blk = self.blocks[bid]
+            blk = self.blocks[key]
             if blk.height <= 1 or start + blk.pad < ws: continue
-            e = self._numbered_row(blk, d)
-            if e is None: continue
-            rows[start + blk.pad] = e
-            self.numbered[str(d)] = bid
+            g = self._digit_gutter(blk.gutter[0], d)
+            if g is None: continue
+            rows[start + blk.pad] = self._row(blk, 0, blk._first, gutter=g)
+            self.numbered[str(d)] = key
             d += 1
 
     # -- the frame ------------------------------------------------------------
@@ -263,7 +330,7 @@ class Compositor:
         off first -- already final, no pre-paint), ink whatever growth pushed across the top
         edge, then repaint the window and tail and park the cursor. Row-level diffing keeps
         keystroke frames cheap and flicker-free on terminals without mode 2026."""
-        if self.paused: return  # the model advanced; the catch-up frame at unpause inks and paints the backlog
+        if self.paused or self._borrowing: return  # the model advanced; the catch-up frame at unpause inks and paints the backlog
         rows = self._doc_rows()
         h, ntail = self.rows, len(self._tail)
         avail = max(0, h - ntail)
@@ -312,84 +379,83 @@ class Compositor:
         self._painted[y] = ansi
 
     # -- public operations ----------------------------------------------------
-    def print_block(self, body=None, gutter=None, tag=None, collapse_at=None, source=None, pad=False):
-        "Append a block to the document (auto-collapsed when born over its threshold) and repaint."
-        blk = Block(self._next_id, body, gutter=gutter, tag=tag, collapse_at=collapse_at, source=source, pad=pad)
-        self._next_id += 1
-        self.blocks[blk.id] = blk
-        self._content_lines(blk)  # measure, so the collapse threshold applies before first paint
-        if blk.collapse_at and blk.height > blk.collapse_at: blk.collapsed = True
-        self._epoch.append(blk.id)
-        self._frame()
+    def put(self, key, *body, gutter=None, source=None, collapse_at=None, dim=False, pad=False, after=None, ink=True):
+        """Create or replace the block for `key`, repaint if it is on screen, and return it. A replaced block
+        keeps its place and its fold state. A new block goes after the block keyed `after`, or at the end of
+        the document. It joins the screen document unless it lands among committed blocks. With `ink=False`
+        it is recorded without being painted, for content already on glass such as a foreground job's output."""
+        blk = self.blocks.get(key)
+        if blk is None:
+            blk = Block(key, body, gutter=gutter, collapse_at=collapse_at, source=source, pad=pad)
+            self._insert(blk, after, ink)
+        else: blk.set(body, gutter=gutter, collapse_at=collapse_at, source=source, pad=pad)
+        blk.dim = dim
+        self._content_lines(blk)
+        self._auto_fold(blk)
+        if key in self._epoch: self._frame()
+        self._changed()
         return blk
 
-    def record_block(self, body=None, gutter=None, tag=None, collapse_at=None, source=None):
-        """A model-only block: enters the model outside the screen document, painting nothing --
-        for content whose bytes are already on glass (a fg job's pty output). The transcript
-        view, persistence, and the Dialog all see it; the screen never repeats it."""
-        blk = Block(self._next_id, body, gutter=gutter, tag=tag, collapse_at=collapse_at, source=source)
-        self._next_id += 1
-        self.blocks[blk.id] = blk
-        self._content_lines(blk)  # sets height, so the collapse threshold and views work
-        if blk.collapse_at and blk.height > blk.collapse_at: blk.collapsed = True
-        blk.committed = True
-        return blk
-
-    def extend(self, blk, part):
-        "Append a body part to the still-growing last block; a collapsed block grows its count, not the screen."
-        assert not self._epoch or self._epoch[-1] == blk.id or blk.id > self._epoch[-1], 'only the last block can grow'
-        con = self._console(max(1, self.cols - self._gutter_width(blk)))
-        new = con.render_lines(part, pad=False)
-        first = blk.height == 0
-        blk.body.append(part)
-        if first and new: blk._first = new[0]
-        crossing = blk.collapse_at and not blk.collapsed and blk.height + len(new) > blk.collapse_at
-        blk.height += len(new)
-        if crossing:
-            blk.collapsed = True  # crossing the threshold: fold to the summary, then keep counting
-            self._dirty(blk)
-        elif blk.collapsed:
-            rows = self._block_rows(blk)  # cache exists at current width: refresh the one summary row
-            line = (self._gutter_segs(blk.gutter[0], True, blk.id) + list(blk._first) + self._summary_suffix(blk.height - 1))
-            rows[:] = [(blk.id, self._fit(line))]
+    def _insert(self, blk, after, ink):
+        "Place new `blk` after the block keyed `after` (the end if None). It joins the epoch before its successor, unless that successor is committed or `ink` is off."
+        if after is not None and after not in self.blocks: raise KeyError(after)
+        nxt = None
+        if after is None or after == next(reversed(self.blocks)): self.blocks[blk.key] = blk
         else:
-            rows = self._block_rows(blk)
-            first_g, cont_g = blk.gutter
-            base = blk.height - len(new)
-            for i, segs in enumerate(new):
-                g = self._gutter_segs(first_g if base + i == 0 else cont_g, True, blk.id)
-                rows.append((blk.id, self._fit(g + list(segs))))
-        self._frame()
+            items = list(self.blocks.items())
+            i = next(j for j, (k, _) in enumerate(items) if k == after) + 1
+            nxt = items[i][0]
+            items.insert(i, (blk.key, blk))
+            self.blocks = dict(items)
+        if not ink or (nxt is not None and self.blocks[nxt].committed): blk.committed = True
+        else: self._epoch.insert(len(self._epoch) if nxt is None else self._epoch.index(nxt), blk.key)
 
-    def toggle(self, blk):
-        "Flip a block's disclosure: the screen redraws from the model, so anything in the document toggles (however far its top has inked); one-liners have nothing to hide."
-        if blk.committed or blk.height <= 1: return
-        blk.collapsed = not blk.collapsed
+    def _auto_fold(self, blk):
+        "Collapse `blk` the first time its height passes `collapse_at`. A user toggle disarms this."
+        if blk.auto_fold and blk.collapse_at and blk.height > blk.collapse_at:
+            blk.collapsed, blk.auto_fold = True, False
+            self._dirty(blk)
+
+    def _changed(self):
+        if self.on_change: self.on_change()
+
+    def drop(self, *keys):
+        "Remove blocks from the model, as in a conversation rewind. The window then shows the model as it now stands, and rows already inked stay in history."
+        live = False
+        for k in keys:
+            if self.blocks.pop(k, None) is None: continue
+            if k in self._epoch:
+                self._epoch.remove(k)
+                live = True
+        if live: self._frame()
+        self._changed()
+
+    def extend(self, key, part):
+        "Append a body part to block `key`, rendering only the new lines. A collapsed block grows its hidden-line count, not the screen."
+        blk = self.blocks[key]
+        new = self._console(max(1, self.cols - self._gutter_width(blk))).render_lines(part, pad=False)
+        blk.body.append(part)
+        if blk.height == 0 and new: blk._first = new[0]
+        base = blk.height
+        blk.height += len(new)
+        self._auto_fold(blk)
+        if blk._rows is not None and blk._rw == self.cols:
+            if blk.collapsed: blk._rows[blk.pad:] = [self._row(blk, 0, blk._first)]
+            else: blk._rows += [self._row(blk, base + i, segs) for i, segs in enumerate(new)]
+        if key in self._epoch: self._frame()
+        self._changed()
+
+    def toggle(self, key, collapsed=None):
+        """Flip block `key`'s disclosure, or set it to `collapsed`. A block whose top rows have inked still
+        toggles, because the screen redraws from the model. One-liners have nothing to hide. A toggle that
+        changes the block disarms its auto-collapse."""
+        blk = self.blocks[key]
+        if blk.height <= 1: return
+        new = not blk.collapsed if collapsed is None else collapsed
+        if new == blk.collapsed: return
+        blk.collapsed, blk.auto_fold = new, False
         self._dirty(blk)
-        self._frame()
-
-    def refresh_block(self, blk):
-        "Repaint after model changes made elsewhere (e.g. transcript-mode toggles)."
-        self._dirty(blk)
-        if blk.id in self._epoch: self._frame()
-
-
-    def set_body(self, blk, *renderables, source=None):
-        """Replace a block's content in the model (editing): new renderables, new `source`, re-measured.
-        No repaint here -- the caller frames (or a transcript view rebuilds) when it is ready; rows
-        already in scrollback keep the old text, which is the log being a log."""
-        blk.body = list(renderables)
-        blk.source = source
-        blk._first = None
-        self._dirty(blk)
-        self._content_lines(blk)  # height now reflects the new content, for disclosure and views
-
-    def remove_block(self, blk):
-        """Remove a block from the model entirely (conversation rewind): the window then shows the model
-        as it now stands. Rows the block already inked stay in history -- the log is a log."""
-        self.blocks.pop(blk.id, None)
-        if blk.id in self._epoch: self._epoch.remove(blk.id)
-        self._frame()
+        if key in self._epoch: self._frame()
 
     def set_tail(self, *renderables, cursor=None, over=()):
         """Repaint the tail. `cursor=(line, cell col)` rests the visible cursor on that tail line;
@@ -417,19 +483,16 @@ class Compositor:
         self._invalidate()
         self._frame()
 
-    def release(self):
-        """Begin a borrow: the borrower (a fg job on the pty) owns the terminal until `reanchor`.
-        Content rows on glass are final -- the borrower's output will scroll them into history --
-        and the tail (chrome, not transcript) is erased, leaving the cursor at column 0 of a
-        fresh line. The epoch ends: after the borrow the document restarts below the borrower's
-        output, and everything before it is inked for good."""
+    def commit(self):
+        """End the epoch: the blocks on screen become printed trace, and later blocks print below them.
+        The tail (chrome, not transcript) is erased, leaving the cursor at column 0 of a fresh line."""
         v = len(self._doc_rows()) - self._ws
         y = self._top + v
         if y > self.rows - 1:  # content reaches the bottom row: open a fresh line (the scroll inks one row, as displayed)
             self.tty.write(f'\x1b[{self.rows};1H\r\n\x1b[J')
             y = self.rows - 1
         else: self.tty.write(f'\x1b[{y + 1};1H\x1b[J')
-        for b in self.blocks.values(): b.committed = True
+        for k in self._epoch: self.blocks[k].committed = True
         self._epoch = []
         self._ws = 0
         self._tail = []
@@ -438,17 +501,25 @@ class Compositor:
         self._top = y
         self._invalidate()
 
-    async def reanchor(self):
-        "End a borrow: whatever the borrower painted is history now; adopt the (possibly new) size and learn a fresh origin -- the startup move again."
-        self._adopt_size()
-        for b in self.blocks.values(): b.committed = True
-        self._epoch = []
-        self._ws = 0
-        self._tail = []
-        self._over = []
-        self._tail_cursor = None
-        row, col = await self._ask_cursor()
-        if col:
-            self.tty.write('\r\n')
-            row = min(row + 1, self.rows - 1)
-        self._top = row
+    @asynccontextmanager
+    async def borrow(self, on_resize=None):
+        """Lend the terminal to a foreground program, yielding the tty. The borrow commits the screen, stops
+        reading input, pauses frames, resets the terminal modes set through `set_modes` and enters raw mode.
+        While it lasts, SIGWINCH goes to `on_resize`. On exit it restores cooked mode and those modes, learns a
+        fresh origin below whatever the borrower printed, and then resumes input. Blocks put during the borrow
+        paint after it."""
+        reading = self._reading
+        self._reader_off()
+        self.commit()
+        modes = list(self._modes)
+        self._reset_modes()  # the borrower must not receive mouse reports or paste brackets
+        self.tty.raw()
+        self._borrowing, self._borrow_resize = True, on_resize
+        try: yield self.tty
+        finally:
+            self.tty.cooked()
+            self.set_modes(*modes)
+            self._borrowing, self._borrow_resize = False, None
+            self._adopt_size()
+            await self._anchor()
+            if reading: self._reader_on()

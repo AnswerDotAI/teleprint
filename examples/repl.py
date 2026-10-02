@@ -16,11 +16,10 @@ HINT = 'echo-REPL -- Enter echoes; click #n lines; ctrl-D quits'
 
 async def amain():
     t = RealTty()
-    t.write('\x1b[?1000;1006h\x1b[?2004h')  # SGR mouse + bracketed paste
     done = asyncio.Event()
     buf = Buffer()
     try:
-        comp = await Compositor(t).start()  # start owns the signals now: WINCH repaints, ctrl-C arrives as a key
+        comp = await Compositor(t).start()  # start owns the signals, mouse and paste modes, and reading input
         def paint():
             comp.set_tail(Text(HINT, style='reverse'), Text('> ') + Text(buf.text),
                           cursor=(1, buf.cell_cursor('> ')))
@@ -31,29 +30,23 @@ async def amain():
             if k.name == 'enter':
                 line = buf.text
                 buf.clear()
-                comp.print_block(Text(line), gutter=(Text('» ', style='green'), Text('  ')))
-                comp.print_block(f'echo: {line}')
+                n = len(comp.blocks)
+                comp.put(f'in{n}', Text(line), gutter=(Text('» ', style='green'), Text('  ')))
+                comp.put(f'out{n}', f'echo: {line}')
             elif k.name == 'ctrl+o':
                 live = [b for b in comp.blocks.values() if not b.committed]
-                if live: comp.toggle(live[-1])
+                if live: comp.toggle(live[-1].key)
             elif k.name == 'ctrl+c': buf.clear()
             else: buf.handle(k)
             paint()
         comp.on_key = on_key
         comp.on_paste = lambda text: (buf.insert(text), paint())
         comp.on_resize = lambda: (comp.resize(), paint())
-        loop = asyncio.get_running_loop()
-        loop.add_reader(t.fd, lambda: comp.on_bytes(t.read(timeout=0)))
         paint()
-        try:
-            while not done.is_set():   # the input parser needs periodic flushes (esc disambiguation)
-                try: await asyncio.wait_for(done.wait(), 0.2)
-                except asyncio.TimeoutError: comp.flush_input()
-        finally:
-            loop.remove_reader(t.fd)
-            comp.stop()
+        try: await done.wait()
+        finally: comp.stop()
     finally:
-        t.write('\x1b[?2004l\x1b[?1000;1006l\r\n')
+        t.write('\r\n')
         t.restore()
 
 if __name__ == '__main__':

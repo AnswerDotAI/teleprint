@@ -56,9 +56,19 @@ def test_flush_never_shatters_split_sequence():
     "A CPR reply split across reads survives an intervening flush tick (the resize-wedge bug's second half)."
     p = Parser()
     assert p.feed(b'\x1b') == []
-    assert p.flush() == []                             # armed, not fired
+    assert p.flush() == []                             # one quiet flush: not fired
     assert p.feed(b'[48;87R') == [CPR(47, 86)]         # the tail arrives: reparsed whole, no garbage keys
 
+def test_control_string_waits_out_flushes():
+    "A terminal reply split across reads is never reparsed as keys by the ESC flush; an abandoned `ESC ]` still resolves, after STR_FLUSHES."
+    from teleprint.keys import Ctl, STR_FLUSHES
+    p = Parser()
+    assert p.feed(b'\x1b]11;rgb:1111/') == []
+    for _ in range(STR_FLUSHES - 1): assert p.flush() == []
+    assert p.feed(b'2222/3333\x07') == [Ctl('osc', '11;rgb:1111/2222/3333')]
+    assert p.feed(b'\x1b]x') == []
+    for _ in range(STR_FLUSHES - 1): assert p.flush() == []
+    assert p.flush() == [Key('escape'), Key(']', ']'), Key('x', 'x')]
 def test_paste():
     p = Parser()
     evs = p.feed(b'\x1b[200~hello\nworld\x1b[201~x')

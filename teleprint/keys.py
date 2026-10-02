@@ -31,6 +31,7 @@ class Ctl:
 
 STR_KINDS = {0x5d: 'osc', 0x5f: 'apc', 0x50: 'dcs', 0x5e: 'pm', 0x58: 'sos'}
 MAX_CTL = 1 << 20  # a runaway unterminated control string gets dropped rather than buffered forever
+STR_FLUSHES = 10  # flushes a buffered ESC waits when a control-string introducer follows it: about 2 s at the reader's 0.2 s tick
 
 C0 = {0x0d:'enter', 0x0a:'enter', 0x09:'tab', 0x7f:'backspace', 0x00:'ctrl+space'}
 CSI_FINAL = {'A':'up','B':'down','C':'right','D':'left','H':'home','F':'end','Z':'shift+tab'}
@@ -65,11 +66,11 @@ class Parser:
     def __init__(self):
         self._buf = b''
         self._paste = None  # bytes collected so far when inside a bracketed paste
-        self._armed = False  # set by flush on first sight of a pending ESC; new bytes disarm
+        self._quiet = 0  # flushes since the last bytes arrived, while an ESC is pending
 
     def feed(self, data):
         if isinstance(data, str): data = data.encode()
-        if data: self._armed = False
+        if data: self._quiet = 0
         self._buf += data
         out = []
         while self._buf:
@@ -93,17 +94,13 @@ class Parser:
         return out
 
     def flush(self):
-        """Resolve a buffered leading ESC as the escape key, arming on the first call and firing on
-        the second (call after a read timeout). One-call resolution shattered escape sequences whose
-        tail was still in flight -- a late CPR reply became composer text -- so only an ESC still
-        pending across two full timeouts resolves; any new bytes disarm."""
+        """Call after each read timeout. A buffered leading ESC resolves as the escape key, and the bytes
+        after it parse again, once two flushes pass with no new input. When a control-string introducer
+        follows the ESC, it waits `STR_FLUSHES` flushes instead. New bytes restart the count."""
         if not self._buf.startswith(b'\x1b'): return []
-        if not self._armed:
-            self._armed = True
-            return []
-        rest = self._buf[1:]
-        self._buf = b''
-        self._armed = False
+        self._quiet += 1
+        if self._quiet < (STR_FLUSHES if len(self._buf) > 1 and self._buf[1] in STR_KINDS else 2): return []
+        rest, self._buf, self._quiet = self._buf[1:], b'', 0
         return [Key('escape')] + self.feed(rest)
 
     def _parse1(self):

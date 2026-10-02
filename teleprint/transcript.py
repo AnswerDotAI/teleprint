@@ -26,18 +26,20 @@ class TranscriptView:
         self.comp, self.tail_fn = comp, tail_fn
         self.active = False
         self.top = 0
-        self.cur = None        # block-cursor id (its gutter renders reversed)
-        self.lines = []        # the whole model, rendered: (block id, segments) per line
+        self.cur = None        # block-cursor key (its gutter renders reversed)
+        self.lines = []        # the whole model, rendered: (block key, segments) per line
         self.composing = False # compose focus: keys are the composer's until Esc
         self.search = None     # open search prompt: {'pat', 'd'}
         self.last = None       # last executed search (pat, d), for n/N
         self.msg = None        # transient status line (search misses, copy feedback)
         self.follow = False  # pinned to the tail: new blocks scroll the view (navigation unpins, G re-pins)
         self._view_rows = max(1, comp.rows - 2)
+        self._prev_change = None  # the app's on_change hook, which the open view replaces, calls and then restores
 
     # -- lifecycle -------------------------------------------------------------
     def enter(self):
-        self.comp.tty.write('\x1b[?1049h')
+        self.comp.set_modes(1049)
+        self._prev_change, self.comp.on_change = self.comp.on_change, self.notify
         self.active = True
         self.comp.paused = True  # the alt screen owns the tty: main-screen frames go model-only until leave
         self.composing, self.search, self.msg = False, None, None
@@ -46,10 +48,10 @@ class TranscriptView:
         self.rebuild(bottom=True)
 
     def leave(self):
-        self.comp.tty.write('\x1b[?1049l')
+        self.comp.set_modes(1049, on=False)
+        self.comp.on_change, self._prev_change = self._prev_change, None
         self.active = False
         self.comp.paused = False
-        for blk in self.comp.blocks.values(): self.comp._dirty(blk)  # toggles/edits made here render fresh
         self.comp._frame()  # one catch-up frame: anything printed or changed during the view inks and paints now
 
     # -- model rendering -------------------------------------------------------
@@ -72,13 +74,13 @@ class TranscriptView:
         c = self.comp
         rx = self._rx(self.last[0]) if self.last is not None else None
         self.lines = []
-        for bid, blk in c.blocks.items():
-            lines = c._block_lines(blk, live=blk.height > 1)  # committed blocks are live HERE
-            if rx is not None: lines = [(b, self._hl_matches(segs, rx)) for b, segs in lines]
-            if bid == self.cur and lines:
-                segs = [Segment(s.text, (s.style or Style()) + Style(reverse=True)) if i == 0 else s
-                        for i, s in enumerate(lines[0][1])]
-                lines[0] = (bid, segs)
+        for key, blk in c.blocks.items():
+            lines = list(c._block_rows(blk))  # committed blocks are live HERE; copied, so highlighting leaves the cache alone
+            if rx is not None: lines = [(k, self._hl_matches(segs, rx)) for k, segs in lines]
+            if key == self.cur and len(lines) > blk.pad:
+                i = blk.pad  # the first content row: a pad row has nothing to reverse
+                lines[i] = (key, [Segment(s.text, (s.style or Style()) + Style(reverse=True)) if j == 0 else s
+                                  for j, s in enumerate(lines[i][1])])
             self.lines += lines
         if bottom: self.top = len(self.lines)  # clamped to the last page in draw
         self.draw()
@@ -143,10 +145,12 @@ class TranscriptView:
         self._scroll_to(bid)
 
     def notify(self):
-        "The host's new-content signal: while following, the view tracks the tail as blocks arrive."
-        if self.active and self.follow:
-            self.cur = next(reversed(self.comp.blocks), None)
-            self.rebuild(bottom=True)
+        """The compositor's `on_change` hook while the view is open. It calls the hook it replaced, then
+        re-renders the model. Following, it tracks the tail as blocks arrive. Unpinned, it keeps its place."""
+        if self._prev_change: self._prev_change()
+        if not self.active: return
+        if self.follow: self.cur = next(reversed(self.comp.blocks), None)
+        self.rebuild(bottom=self.follow)
 
     def jump(self, end):
         "The g/G motions: block cursor to the first or last block. G resumes following the tail."
@@ -158,11 +162,10 @@ class TranscriptView:
         self.rebuild(bottom=end)
 
     def toggle_current(self):
-        if self.cur is not None: self._toggle(self.comp.blocks[self.cur])
+        if self.cur is not None: self._toggle(self.cur)
 
-    def _toggle(self, blk):
-        if blk.height <= 1: return
-        blk.collapsed = not blk.collapsed
+    def _toggle(self, key):
+        self.comp.toggle(key)
         self.rebuild()
 
     def on_mouse(self, ev):
@@ -171,9 +174,9 @@ class TranscriptView:
         if ev.press and ev.btn in (64, 65): self.scroll(-3 if ev.btn == 64 else 3)
         elif ev.press and ev.btn == 0:
             j = self.top + ev.y
-            if j < len(self.lines):
+            if ev.y < self._view_rows and j < len(self.lines):
                 self.cur = self.lines[j][0]
-                self._toggle(self.comp.blocks[self.cur])
+                self._toggle(self.cur)
         return True
 
     # -- search and copy -------------------------------------------------------
@@ -203,8 +206,7 @@ class TranscriptView:
 
     def _land(self, bid):
         "Cursor to a match, expanding it (fold-open-on-search) so the found text is on show."
-        blk = self.comp.blocks[bid]
-        if blk.collapsed: blk.collapsed = False  # fold-open on landing; the leave-frame repaints main-screen
+        self.comp.toggle(bid, False)  # fold-open on landing; the leave-frame repaints the main screen
         self.cur = bid
         self.rebuild()
         self._scroll_to(bid)

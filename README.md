@@ -51,11 +51,25 @@ The main components are:
 - Widgets for completion menus, tooltips, and signatures.
 - `RealTty` and `EmuTty`: real-terminal I/O and a pyghostty-backed terminal for headless tests.
 
+## Blocks
+
+The application names each block with a key and gives it Rich renderables:
+
+```python
+comp.put('in1', Text('x = 41'), gutter=IN)
+comp.put('out1', gutter=OUT)                   # an empty block, filled as output streams
+comp.extend('out1', 'first line of output')
+comp.put('in1', Text('x = 42'), gutter=IN)     # the same key replaces the block in place
+comp.drop('out1')
+```
+
+`put` with a new key appends a block, or inserts it after the block named by `after`. `put` with an existing key replaces the block's content, and keeps its place and whether it is folded. `extend` adds to a block that is still growing, rendering only the new lines. `toggle(key)` folds or unfolds a block.
+
 ## Foreground commands and terminal ownership
 
-One component owns terminal input and output at a time. When an editor or foreground command needs the terminal, the application calls `comp.release()`, hands over I/O, then awaits `comp.reanchor()` when the command finishes. The compositor resumes below the command's output. Earlier output remains in history.
+One component owns terminal input and output at a time. When an editor or foreground command needs the terminal, the application runs it inside `async with comp.borrow():`. When the block exits, the compositor resumes below the command's output. Earlier output remains in history.
 
-`comp.record_block()` adds output that is already on the terminal to the block model without printing it a second time. The application owns process execution and output capture. In ipyai, shell processes and the emulator mirror used to capture their output belong to the shell integration; teleprint provides the terminal handoff operations.
+`comp.put(..., ink=False)` adds output that is already on the terminal to the block model without printing it a second time. The application owns process execution and output capture. In ipyai, shell processes and the emulator mirror used to capture their output belong to the shell integration; teleprint provides the terminal handoff.
 
 ## Background work and errors
 
@@ -76,16 +90,16 @@ def on_key(k):
 `spawn` retains each task until completion. Set `on_task_error` to report uncaught failures through the UI instead of writing a traceback over the screen:
 
 ```python
-comp.on_task_error = lambda e, t: comp.print_block(f'{t.get_name()} failed: {e!r}', gutter=ERR)
+comp.on_task_error = lambda e, t: comp.put(f'error-{id(t)}', f'{t.get_name()} failed: {e!r}', gutter=ERR)
 ```
 
 Cancellation does not call this hook. Without a hook, failures retain asyncio's default reporting. Use a task created outside `spawn` when its owner awaits it and handles the exception itself; routing that failure through the hook as well would report it twice.
 
 ## Signals and testing
 
-`await comp.start()` installs signal handlers on the main thread; `comp.stop()` restores them. The handlers work as follows:
+`await comp.start()` installs the signal handlers, turns on mouse reporting and bracketed paste, and starts reading input. `comp.stop()` gives all of this back. The handlers work as follows:
 
-- **SIGWINCH:** calls `on_resize` when set, or resizes and repaints by default. An application with its own tail state should set `comp.on_resize = lambda: (comp.resize(), paint())`. During a terminal handoff, its resize handler can forward the new size to the foreground command instead of repainting over it.
+- **SIGWINCH:** calls `on_resize` when set, or resizes and repaints by default. An application with its own tail state should set `comp.on_resize = lambda: (comp.resize(), paint())`. During a borrow, SIGWINCH goes to the `on_resize` passed to `borrow` instead, which can forward the new size to the foreground command.
 - **SIGINT:** enters key dispatch as `Key('ctrl+c')`.
 - **SIGTERM/SIGHUP:** restore the terminal before terminating with the default signal disposition.
 
