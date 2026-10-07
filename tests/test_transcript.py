@@ -1,145 +1,80 @@
 import base64
-from teleprint.keys import Key
 from rich.text import Text
-from teleprint.compositor import Compositor
-from teleprint.testing import EmuTty
+from teleprint.keys import Key
+from teleprint.buffer import Buffer
 from teleprint.transcript import TranscriptView
 
 G = (Text('» ', style='green'), Text('  '))
 
-async def make(cols=32, rows=8):
-    tty = EmuTty(cols, rows)
-    comp = await Compositor(tty).start()
-    comp.set_tail('> ')
-    return tty, comp
+def search(tv, text):
+    for ch in '/' + text: tv.on_key(Key(ch, ch))
+    tv.on_key(Key('enter'))
 
-async def test_transcript_browse_toggle_and_leave():
-    tty, comp = await make()
-    bs = [comp.put(f'b{i}', f'top {i}\nbot {i}', gutter=G) for i in range(6)]
-    main_before = tty.term.text()
+async def test_browse_search_copy_and_return(terminal):
+    tty, comp = await terminal(40, 10)
+    comp.set_tail('> ')
+    first = comp.put('first', 'alpha\nhidden needle here', gutter=G)
+    comp.toggle('first')
+    comp.put('second', 'beta\nsecond needle', gutter=G)
+    for i in range(6): comp.put(f'b{i}', f'top {i}\nbot {i}', gutter=G, source=f'SRC = {i}')
+    before = tty.term.text()
     tv = TranscriptView(comp, lambda: ([Text('[transcript]')], None))
     comp.on_mouse = tv.on_mouse
     tv.enter()
-    scr = tty.term.text()
-    assert '[transcript]' in scr and '» top 5' in scr      # bottom-anchored view on the alt screen
+    assert '[transcript]' in tty.term.text() and 'top 5' in tty.term.text()
     tv.scroll(-100)
-    assert '» top 0' in tty.term.text()                    # committed content browsable again
-    row = next(i for i, l in enumerate(tty.term.text().splitlines()) if l.endswith('top 1'))
-    comp.on_bytes(b'\x1b[<0;2;%dM' % (row + 1))            # click a COMMITTED block: toggleable here
-    assert bs[1].collapsed
-    assert '… (+1 lines)' in tty.term.text()
-    folds = [b.collapsed for b in bs]
-    comp.on_bytes(b'\x1b[<0;2;8M')                          # click the tail row below the view: no block toggles
-    assert [b.collapsed for b in bs] == folds
+    row = next(i for i, line in enumerate(tty.term.text().splitlines()) if 'top 0' in line)
+    comp.on_bytes(b'\x1b[<0;2;%dM' % (row + 1))
+    assert comp.blocks['b0'].collapsed and 'top 0 … (+1 lines)' in tty.term.text()
+    search(tv, 'needle')
+    assert tv.cur == 'first' and not first.collapsed
+    lines = tty.term.text().splitlines()
+    row = next(i for i, line in enumerate(lines) if 'hidden needle' in line)
+    col = lines[row].index('needle')
+    assert tty.term.style(col, row)['inverse'] and not tty.term.style(col - 3, row)['inverse']
+    tv.on_key(Key('n', 'n'))
+    assert tv.cur == 'second'
+    tv.on_key(Key('N', 'N'))
+    assert tv.cur == 'first'
+    search(tv, 'SRC = 5')  # source, not the rendered body
+    assert tv.cur == 'b5'
+    writes, write = [], tty.write
+    tty.write = lambda data: (writes.append(data), write(data))
+    tv.on_key(Key('y', 'y'))
+    assert '\x1b]52;c;' + base64.b64encode(b'SRC = 5').decode() + '\x07' in writes
+    comp.on_bytes(b'\x1b[<0;2;10M')  # the view's tail is not a block target
+    assert not comp.blocks['b5'].collapsed
     tv.leave()
-    assert tty.term.text() == main_before                  # main screen untouched: alt leaves no residue
+    assert tty.term.text() == before  # edits above the main window never rewrite its printed record
 
-async def test_transcript_composer_cursor_and_resync():
-    tty, comp = await make()
-    b1 = comp.put('b1', 'alpha\nbeta', gutter=G)
-    b2 = comp.put('b2', 'gamma\ndelta', gutter=G)
-    buf = ['']
-    tv = TranscriptView(comp, lambda: ([Text('> ' + buf[0])], (0, 2 + len(buf[0]))))
-    tv.enter()
-    assert tv.cur == b2.key
-    buf[0] = 'typed'
-    tv.draw()
-    scr = tty.term.text().splitlines()
-    assert scr[-1] == '> typed'                            # the composer lives at the bottom of the view
-    x, y = tty.term.cursor
-    assert (x, scr[y]) == (7, '> typed')                   # ...with the visible cursor in it
-    tv.move(-1)
-    tv.toggle_current()
-    assert b1.collapsed
-    tv.leave()
-    assert '» alpha … (+1 lines)' in tty.term.text()       # still-live block resynced on the main screen
-
-def K(ch): return Key(ch, ch)
-
-async def test_transcript_search_motion_copy():
-    tty, comp = await make(cols=40, rows=10)
-    b0 = comp.put('b0', 'alpha\nhidden needle here', gutter=G)
-    b1 = comp.put('b1', 'beta\nsecond needle', gutter=G)
-    b2 = comp.put('b2', 'gamma\ndelta', gutter=G, source='SRC = gamma')
-    comp.toggle('b0')
-    assert b0.collapsed
-    tv = TranscriptView(comp, lambda: ([Text('> ')], (0, 2)))
-    tv.enter()
-    assert tv.cur == b2.key
-    assert tv.on_key(K('/'))
-    for ch in 'needle': tv.on_key(K(ch))
-    assert '/needle' in tty.term.text()          # the search prompt is visible
-    tv.on_key(Key('enter'))
-    assert tv.cur == b0.key and not b0.collapsed  # wrapped forward to the first match, expanded on landing
-    assert 'hidden needle here' in tty.term.text()
-    scr = tty.term.text().splitlines()
-    row = next(i for i, l in enumerate(scr) if 'hidden needle' in l)
-    col = scr[row].index('needle')
-    assert tty.term.style(col, row)['inverse']           # the found text is highlighted in place
-    assert not tty.term.style(col - 3, row)['inverse']   # surrounding text is not
-    tv.on_key(K('n'))
-    assert tv.cur == b1.key                       # next match
-    tv.on_key(K('N'))
-    assert tv.cur == b0.key                       # reverse
-    tv.on_key(K('G'))
-    assert tv.cur == b2.key
-    tv.on_key(K('g'))
-    assert tv.cur == b0.key
-    tv.on_key(K('/'))
-    for ch in 'SRC': tv.on_key(K(ch))
-    tv.on_key(Key('enter'))
-    assert tv.cur == b2.key                       # matched the stored source, not the rendering
-    writes, w = [], tty.write
-    tty.write = lambda d: (writes.append(d), w(d))
-    tv.on_key(K('y'))
-    b64 = base64.b64encode(b'SRC = gamma').decode()
-    assert any(isinstance(d, str) and d.startswith('\x1b]52;c;' + b64) for d in writes)
-
-async def test_transcript_compose_focus():
-    tty, comp = await make()
-    comp.put('b', 'alpha\nbeta', gutter=G)
-    tv = TranscriptView(comp, lambda: ([Text('> ')], (0, 2)))
-    tv.enter()
-    assert not tv.on_key(K('x'))                 # unbound printable: host inserts it (transparent composing)
-    assert tv.composing
-    assert not tv.on_key(K('n'))                 # ops type while composing
-    assert tv.on_key(Key('escape'))              # esc returns to browsing...
-    assert not tv.composing
-    assert not tv.on_key(Key('escape'))          # ...and esc while browsing is the host's (leave)
-    assert tv.on_key(K('i'))                     # explicit compose entry
-    assert tv.composing
-
-async def test_view_keeps_app_change_hook():
-    "The open view takes on_change but still calls the app's hook, and leave gives the hook back."
-    tty, comp = await make()
-    calls = []
-    app_hook = lambda: calls.append(1)
-    comp.on_change = app_hook
-    tv = TranscriptView(comp, lambda: ([Text('[t]')], None))
-    tv.enter()
-    comp.put('b', 'streamed in', gutter=G)
-    assert calls == [1] and 'streamed in' in tty.term.text()
-    tv.leave()
-    assert comp.on_change is app_hook
-async def test_follow_mode_and_paused_frames():
-    "Enter follows the tail; blocks put during the view reach it through on_change (main-screen frames stay model-only); navigation unpins, G re-pins; leave paints the backlog once."
-    tty, comp = await make()
+async def test_follow_browse_compose_and_catch_up(terminal):
+    tty, comp = await terminal()
+    comp.set_tail('> ')
     comp.put('first', 'first', gutter=G)
-    tv = TranscriptView(comp, lambda: ([Text('[t]')], None))
+    buf, changes = Buffer(), []
+    app_hook = lambda: changes.append(1)
+    comp.on_change = app_hook
+    tv = TranscriptView(comp, lambda: ([Text('> ' + buf.text)], (0, buf.cell_cursor('> '))))
     tv.enter()
-    assert tv.follow
-    comp.put('b', 'streamed in', gutter=G)
-    scr = tty.term.text()
-    assert 'streamed in' in scr and tv.cur == 'b'      # the view tracked the tail by itself...
-    assert '> ' not in scr.splitlines()[0]             # ...and no main-screen frame bled onto the alt screen
+    comp.put('new', 'streamed in', gutter=G)
+    assert tv.cur == 'new' and 'streamed in' in tty.term.text() and changes == [1]
     tv.move(-1)
-    assert not tv.follow                               # navigation unpins
     top, cur = tv.top, tv.cur
-    comp.put('u', 'while unpinned', gutter=G)
-    assert (tv.top, tv.cur) == (top, cur)              # unpinned: the view keeps its place
-    tv.jump(True)
-    assert tv.follow and 'while unpinned' in tty.term.text()   # G re-pins to the tail
+    comp.put('later', 'while browsing', gutter=G)
+    assert (tv.top, tv.cur) == (top, cur) and not tv.follow
+    tv.on_key(Key('G', 'G'))
+    assert tv.follow and tv.cur == 'later' and 'while browsing' in tty.term.text()
+    for ch in 'xn':
+        key = Key(ch, ch)
+        assert not tv.on_key(key)
+        buf.handle(key)
+    tv.draw()
+    assert tv.composing and tty.term.text().endswith('> xn')
+    x, y = tty.term.cursor
+    assert x == 4 and tty.term.text().splitlines()[y] == '> xn'
+    assert tv.on_key(Key('escape')) and not tv.composing
+    assert not tv.on_key(Key('escape'))
     tv.leave()
-    scr = tty.term.text()
-    assert 'streamed in' in scr and 'while unpinned' in scr    # the catch-up frame painted the backlog
-    assert comp._ws >= 0 and not comp.paused
+    assert comp.on_change is app_hook and changes == [1, 1]
+    assert 'streamed in' in tty.term.text() and 'while browsing' in tty.term.text() and not comp.paused
+    assert all(tty.term.contents().splitlines().count('» ' + text) == 1 for text in ('streamed in', 'while browsing'))

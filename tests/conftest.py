@@ -1,5 +1,7 @@
 "Suite-wide ambient-state hygiene."
 import pytest, signal
+from teleprint.compositor import Compositor
+from teleprint.testing import EmuTty
 
 _SIGS = (signal.SIGWINCH, signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
@@ -11,3 +13,17 @@ def _restore_signal_dispositions():
     saved = {s: signal.getsignal(s) for s in _SIGS}
     yield
     for s, h in saved.items(): signal.signal(s, h)
+
+@pytest.fixture
+async def terminal():
+    owned = []
+    async def start(cols=40, rows=10, shell=''):
+        tty = EmuTty(cols, rows)
+        if shell: tty.write(shell)
+        comp = Compositor(tty)
+        owned.append((tty, comp))
+        return tty, await comp.start()
+    yield start
+    for tty, comp in owned:
+        comp.stop()
+        tty.close()

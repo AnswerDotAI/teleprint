@@ -1,94 +1,37 @@
-from teleprint.keys import Parser, Key, Paste, Mouse, CPR
+from teleprint.keys import Parser, Key, Paste, Mouse, CPR, Ctl, STR_FLUSHES
 
-def feed1(data):
-    "Feed in one call, expect exactly one event."
-    evs = Parser().feed(data)
-    assert len(evs) == 1, evs
-    return evs[0]
+def test_terminal_input_stream():
+    p = Parser()
+    assert p.feed('aé日\r\n\t\x7f\x01\x0f') == [
+        Key('a', 'a'), Key('é', 'é'), Key('日', '日'), Key('enter'), Key('enter'), Key('tab'),
+        Key('backspace'), Key('ctrl+a'), Key('ctrl+o')]
+    assert p.feed(b'\x1b[A\x1b[1;5C\x1b[1;2A\x1b[3~\x1b[5~\x1b[Z\x1bOP\x1bf\x1b\x7f') == [
+        Key('up'), Key('ctrl+right'), Key('shift+up'), Key('delete'), Key('pageup'), Key('shift+tab'),
+        Key('f1'), Key('alt+f'), Key('alt+backspace')]
+    assert p.feed(b'\x1b[<0;3;15M\x1b[<64;5;5M\x1b[<0;3;15m\x1b[12;1R') == [
+        Mouse(0, 2, 14, True), Mouse(64, 4, 4, True), Mouse(0, 2, 14, False), CPR(11, 0)]
 
-def test_printables_and_controls():
-    assert feed1('a') == Key('a', 'a')
-    assert feed1('é') == Key('é', 'é')
-    assert feed1('日') == Key('日', '日')
-    assert feed1('\r') == Key('enter')
-    assert feed1('\n') == Key('enter')   # 0x0a is enter, like 0x0d: pastes/scripts send it, and readline's C-j is accept-line
-    assert feed1('\t') == Key('tab')
-    assert feed1('\x7f') == Key('backspace')
-    assert feed1('\x01') == Key('ctrl+a')
-    assert feed1('\x0f') == Key('ctrl+o')
-
-def test_escape_sequences():
-    assert feed1('\x1b[A') == Key('up')
-    assert feed1('\x1b[1;5C') == Key('ctrl+right')
-    assert feed1('\x1b[1;2A') == Key('shift+up')
-    assert feed1('\x1b[3~') == Key('delete')
-    assert feed1('\x1b[5~') == Key('pageup')
-    assert feed1('\x1b[Z') == Key('shift+tab')
-    assert feed1('\x1bOP') == Key('f1')
-    assert feed1('\x1bf') == Key('alt+f')
-    assert feed1('\x1b\x7f') == Key('alt+backspace')
-
-def test_mouse_and_cpr():
-    assert feed1(b'\x1b[<0;3;15M') == Mouse(0, 2, 14, True)
-    assert feed1(b'\x1b[<64;5;5M') == Mouse(64, 4, 4, True)
-    assert feed1(b'\x1b[<0;3;15m') == Mouse(0, 2, 14, False)
-    assert feed1(b'\x1b[12;1R') == CPR(11, 0)
-
-def test_split_sequences():
+def test_split_paste_and_terminal_replies():
     p = Parser()
     assert p.feed(b'\x1b[<0;1;') == []
-    assert p.feed(b'2M') == [Mouse(0, 0, 1, True)]
-    assert p.feed('日'.encode()[:1]) == []
-    assert p.feed('日'.encode()[1:]) == [Key('日', '日')]
-    assert p._buf == b''
-
-def test_lone_escape_flush():
-    "flush arms on first sight and fires on the second: a just-arrived ESC may be a split sequence."
-    p = Parser()
-    assert p.feed(b'\x1b') == []
-    assert p.flush() == []                             # armed: could still be a sequence head
-    assert p.flush() == [Key('escape')]                # still alone a tick later: the escape key
-    assert p.feed(b'\x1b[') == []
-    assert p.flush() == []
-    assert p.flush() == [Key('escape'), Key('[', '[')]  # ESC resolved; the '[' reparses as a printable
-
-def test_flush_never_shatters_split_sequence():
-    "A CPR reply split across reads survives an intervening flush tick (the resize-wedge bug's second half)."
-    p = Parser()
-    assert p.feed(b'\x1b') == []
-    assert p.flush() == []                             # one quiet flush: not fired
-    assert p.feed(b'[48;87R') == [CPR(47, 86)]         # the tail arrives: reparsed whole, no garbage keys
-
-def test_control_string_waits_out_flushes():
-    "A terminal reply split across reads is never reparsed as keys by the ESC flush; an abandoned `ESC ]` still resolves, after STR_FLUSHES."
-    from teleprint.keys import Ctl, STR_FLUSHES
-    p = Parser()
-    assert p.feed(b'\x1b]11;rgb:1111/') == []
+    assert p.feed(b'2M' + '日'.encode()[:1]) == [Mouse(0, 0, 1, True)]
+    assert p.feed('日'.encode()[1:] + b'\x1b') == [Key('日', '日')]
+    assert p.flush() == []  # a tick must not shatter the pending sequence
+    assert p.feed(b'[48;87R\x1b[200~hello\nworld\x1b[20') == [CPR(47, 86)]
+    assert p.feed(b'1~x\x1b]11;rgb:1111/') == [Paste('hello\nworld'), Key('x', 'x')]
     for _ in range(STR_FLUSHES - 1): assert p.flush() == []
-    assert p.feed(b'2222/3333\x07') == [Ctl('osc', '11;rgb:1111/2222/3333')]
-    assert p.feed(b'\x1b]x') == []
-    for _ in range(STR_FLUSHES - 1): assert p.flush() == []
-    assert p.flush() == [Key('escape'), Key(']', ']'), Key('x', 'x')]
-def test_paste():
-    p = Parser()
-    evs = p.feed(b'\x1b[200~hello\nworld\x1b[201~x')
-    assert evs == [Paste('hello\nworld'), Key('x', 'x')]
-    p2 = Parser()
-    assert p2.feed(b'\x1b[200~abc\x1b[20') == []
-    assert p2.feed(b'1~') == [Paste('abc')]
+    assert p.feed(b'2222/3333\x07\x1b_Gi=31;O') == [Ctl('osc', '11;rgb:1111/2222/3333')]
+    assert p.feed(b'K\x1b') == []
+    assert p.feed(b'\\x\x1bP1$r0m\x1b\\\x1b]0;title\x1b\\') == [
+        Ctl('apc', 'Gi=31;OK'), Key('x', 'x'), Ctl('dcs', '1$r0m'), Ctl('osc', '0;title')]
 
-def test_mixed_stream():
-    evs = Parser().feed(b'hi\r\x1b[A\x1b[<0;1;1M')
-    assert evs == [Key('h','h'), Key('i','i'), Key('enter'), Key('up'), Mouse(0,0,0,True)]
-
-def test_control_strings():
-    from teleprint.keys import Ctl
-    assert feed1(b'\x1b]11;rgb:fafa/fafa/f4f4\x1b\\') == Ctl('osc', '11;rgb:fafa/fafa/f4f4')
-    assert feed1(b'\x1b]0;title\x07') == Ctl('osc', '0;title')  # BEL terminator
-    assert feed1(b'\x1b_Gi=31;OK\x1b\\') == Ctl('apc', 'Gi=31;OK')
-    assert feed1(b'\x1bP1$r0m\x1b\\') == Ctl('dcs', '1$r0m')
+def test_abandoned_escape_recovery():
     p = Parser()
-    assert p.feed(b'\x1b_Gi=31;O') == []          # split mid-payload
-    assert p.feed(b'K\x1b') == []                 # split mid-terminator
-    assert p.feed(b'\\x') == [Ctl('apc', 'Gi=31;OK'), Key('x', 'x')]
-    assert p._buf == b''
+    for data, ticks, expected in (
+        (b'\x1b', 2, [Key('escape')]),
+        (b'\x1b[', 2, [Key('escape'), Key('[', '[')]),
+        (b'\x1b]x', STR_FLUSHES, [Key('escape'), Key(']', ']'), Key('x', 'x')])):
+        assert p.feed(data) == []
+        for _ in range(ticks - 1): assert p.flush() == []
+        assert p.flush() == expected
+    assert p.feed(b'ok') == [Key('o', 'o'), Key('k', 'k')]
