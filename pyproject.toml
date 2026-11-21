@@ -37,4 +37,6 @@ version = { attr = "teleprint.__version__" }
 include = ["teleprint"]
 
 [tool.pytest.ini_options]
+addopts = "-p asyncio"
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
