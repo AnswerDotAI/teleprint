@@ -13,7 +13,8 @@ authors = [{ name = "teleprint contributors" }]
 classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
 
 [project.optional-dependencies]
-dev = ["fastship", "pytest", "pyghostty"]
+test = ["pytest", "pyghostty"]
+dev = ["fastship", "teleprint[test]"]
 
 [project.urls]
 Homepage = "https://github.com/AnswerDotAI/teleprint"
