@@ -13,7 +13,7 @@ edition.workspace = true
 description = "Keyed live transcripts in native terminal scrollback"
 license = "Apache-2.0"
 repository = "https://github.com/AnswerDotAI/teleprint"
-include = ["src/", "LICENSE", "README.md"]
+include = ["/src/", "/LICENSE", "/README.md"]
 
 [lib]
 test = false
