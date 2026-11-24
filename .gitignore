@@ -1,3 +1,4 @@
+.pytest_cache/
 meta/
 __pycache__/
 *.py[cod]
