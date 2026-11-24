@@ -5,10 +5,10 @@ The root crate contains the transcript renderer and terminal I/O. Rust clients d
 In the Answer.AI workspace, after the initial editable installation:
 
 ```sh
-cargo develop && cargo test && pytest -q
+cargo develop && cargo test --features tty && pytest -q
 ```
 
-`tests/test_transcript.py` feeds the extension's output to Ghostty. It checks native scrollback, the cursor and per-cell styles rather than matching escape sequences. Use `uv build --wheel` to build a distribution through the same backend as a standalone install.
+The Rust tests select blocks and draft rows and hand a real PTY between raw input, a cooked program, and decoded keys. The Python tests feed the extension's output to Ghostty and check scrollback, cursor position, styles and image placement. Use `uv build --wheel` to build a distribution through the same backend as a standalone install.
 
 ## Printing a frame
 

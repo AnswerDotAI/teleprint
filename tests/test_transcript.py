@@ -56,6 +56,7 @@ def test_edit_draft_and_order():
 def test_kitty_placement_in_scrollback():
     from pyghostty import lib
     from teleprint import Image
+    import re
     dot = Image.decode("iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAE0lEQVR4nGPkkfvPAANMcBZeDgA6EwExjmZangAAAABJRU5ErkJggg==")
     transmit, grid = dot.render(0x123456, 8)
     term, view = Terminal(8, 3), Transcript(8, 3)
@@ -63,8 +64,20 @@ def test_kitty_placement_in_scrollback():
     term.feed(view.put('plot', grid))
     assert lib.ghostty_kitty_graphics_image(term.get('kitty_graphics', 'GhosttyKittyGraphics'), 0x123456)
     assert term.style(0, 0)['fg'] == ('rgb', (0x12, 0x34, 0x56))
+    placeholder = '\U0010eeee'
+    def grid_widths(): return [row.count(placeholder) for row in term.text().splitlines() if placeholder in row]
+    assert grid_widths() == [4, 4]
+
+    # Unquote one tmux passthrough packet; Ghostty still has to accept the enclosed image.
+    packet, grid = dot.render(0x654321, 2, tmux=True)
+    payload = re.fullmatch(r'\x1bPtmux;((?:[^\x1b]|\x1b\x1b)+)\x1b\\', packet)
+    assert payload
+    term.feed(payload[1].replace('\x1b\x1b', '\x1b'))
+    term.feed(view.put('plot', grid))
+    assert lib.ghostty_kitty_graphics_image(term.get('kitty_graphics', 'GhosttyKittyGraphics'), 0x654321)
+    assert grid_widths() == [2]
     term.feed(view.put('notes', 'one\ntwo\nthree'))
-    assert '\U0010eeee' in term.contents() and '\U0010eeee' not in term.text()
+    assert placeholder in term.contents() and placeholder not in term.text()
 
 
 def test_selective_sgr_resets_and_wrapping():
