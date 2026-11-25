@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.13,<2.0", "fastws-cli>=0.0.29"]
+requires = ["maturin>=1.13,<2.0", "fastws-cli>=0.0.42"]
 build-backend = "fastws.build_backend"
 
 [project]
@@ -13,7 +13,7 @@ authors = [{ name = "teleprint contributors" }]
 classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
 
 [project.optional-dependencies]
-test = ["pytest", "pyghostty"]
+test = ["fastws-cli>=0.0.42", "pytest", "pyghostty"]
 dev = ["fastship", "teleprint[test]"]
 
 [project.urls]
