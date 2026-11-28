@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 
 fn entries(blocks: &[(String, String)]) -> Vec<(&str, &str)> { blocks.iter().map(|(key, text)| (key.as_str(), text.as_str())).collect() }
 
-#[pyclass(module = "teleprint")]
+#[pyclass(module = "teleprint.core")]
 struct Transcript(teleprint::Transcript);
 
 #[pymethods]
@@ -26,7 +26,7 @@ impl Transcript {
     fn finish(&mut self) -> String { self.0.finish() }
 }
 
-#[pyclass(module = "teleprint")]
+#[pyclass(module = "teleprint.core")]
 struct Image(teleprint::kitty::Image);
 
 #[pymethods]
@@ -39,7 +39,7 @@ impl Image {
 }
 
 #[pymodule]
-fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Image>()?;
     m.add_class::<Transcript>()
